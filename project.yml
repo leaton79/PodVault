@@ -1,0 +1,55 @@
+name: PodVault
+options:
+  bundleIdPrefix: com.podvault
+  deploymentTarget:
+    macOS: "14.0"
+  xcodeVersion: "15.0"
+  createIntermediateGroups: true
+  generateEmptyDirectories: true
+
+settings:
+  base:
+    SWIFT_VERSION: "5.9"
+    MACOSX_DEPLOYMENT_TARGET: "14.0"
+    ENABLE_HARDENED_RUNTIME: YES
+    CODE_SIGN_ENTITLEMENTS: PodVault/Resources/PodVault.entitlements
+    INFOPLIST_FILE: PodVault/Resources/Info.plist
+
+packages:
+  GRDB:
+    url: https://github.com/groue/GRDB.swift
+    from: "6.24.0"
+  FeedKit:
+    url: https://github.com/nmdias/FeedKit
+    from: "9.1.2"
+
+targets:
+  PodVault:
+    type: application
+    platform: macOS
+    sources:
+      - PodVault
+    resources:
+      - Resources
+    dependencies:
+      - package: GRDB
+      - package: FeedKit
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: com.podvault.app
+        PRODUCT_NAME: PodVault
+        ASSETCATALOG_COMPILER_APPICON_NAME: AppIcon
+        COMBINE_HIDPI_IMAGES: YES
+        INFOPLIST_KEY_LSApplicationCategoryType: "public.app-category.entertainment"
+        INFOPLIST_KEY_NSHumanReadableCopyright: "Copyright © 2025 PodVault. All rights reserved."
+
+  PodVaultTests:
+    type: bundle.unit-test
+    platform: macOS
+    sources:
+      - PodVaultTests
+    dependencies:
+      - target: PodVault
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: com.podvault.app.tests

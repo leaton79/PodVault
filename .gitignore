@@ -1,0 +1,27 @@
+# Build files
+.build/
+.swiftpm/
+*.xcodeproj/xcuserdata/
+*.xcworkspace/xcuserdata/
+DerivedData/
+
+# macOS
+.DS_Store
+._*
+
+# App bundle (built artifact)
+PodVault.app/
+
+# Icon build files
+*.iconset/
+create_icon.swift
+icon.svg
+
+# User data
+*.db
+*.json
+
+# IDE
+.idea/
+.vscode/
+*.swp
