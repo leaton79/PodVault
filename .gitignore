@@ -1,6 +1,9 @@
 # Build files
 .build/
 .swiftpm/
+build/
+dist/
+*.xcodeproj/
 *.xcodeproj/xcuserdata/
 *.xcworkspace/xcuserdata/
 DerivedData/

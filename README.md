@@ -1,65 +1,61 @@
-# PodVault 🎧⚡
+# PodVault
 
-A modern, native macOS podcast player built with Swift and SwiftUI.
+Native macOS podcast streaming and offline listening app built with SwiftUI, GRDB, and FeedKit.
 
-![PodVault Screenshot](screenshot.png)
+## What It Does
+- Subscribe to podcast feeds directly or paste a podcast webpage and let the app find the RSS feed.
+- Browse podcasts, all episodes, favorites, downloads, history, and continue-listening items.
+- Stream episodes or play downloaded files locally.
+- Queue episodes, use continuous playback, and control playback speed, skip, and volume boost.
+- Organize podcasts with categories and add notes to episodes.
+- Import/export OPML and export listening history.
 
-## Features
-
-### Playback
-- Stream or play downloaded episodes
-- Playback speed control (0.5x - 2x)
-- Volume boost (50% - 200%)
-- Skip forward/back (30s/15s)
-- Playback position memory
-- Auto-advance queue
-- Continuous playback option
-- Mini player (⇧⌘M)
-
-### Library Management
-- Add podcasts via RSS feed URL
-- Auto-detects RSS from podcast webpage URLs
-- Podcast categories/folders
-- Favorites (podcasts & episodes)
-- Episode notes
-- Playback history
-- OPML import/export
-
-### Organization
-- Episode filters (All, Unplayed, In Progress, Downloaded, Favorites)
-- Episode sorting (Newest, Oldest, Longest, Shortest, Title)
-- Search podcasts and episodes
-- All Episodes view across all podcasts
-
-### Customization
-- 8 color themes
-- 4 font sizes
-- Resizable columns
-
-### Extras
-- Statistics dashboard (⇧⌘S)
-- Export listening history
-- Offline downloads with Show in Finder
-- Keyboard shortcuts
+## Current Highlights
+- One playback system through `PlaybackManager`
+- Database-backed favorites, playback progress, and played state
+- Download queue UI backed by `DownloadManager`
+- Continue Listening section driven by in-progress episodes
+- Refresh summaries for full-library and single-feed sync
+- Indexed episode search using SQLite FTS
 
 ## Requirements
-
-- macOS 13.0 or later
+- macOS 14 or later
+- Xcode 15 or newer
 - Xcode Command Line Tools
+- Homebrew `xcodegen` if you want to generate the Xcode project from `project.yml`
 
-## Installation
+## Build From Source
 
-### Option 1: Download Release
-Download the latest `PodVault.app` from the [Releases](https://github.com/leaton79/podvault/releases) page and drag it to your Applications folder.
+### Swift Package
+For development and tests:
 
-### Option 2: Build from Source
 ```bash
-git clone https://github.com/leaton79/podvault.git
-cd podvault
+git clone https://github.com/leaton79/PodVault.git
+cd PodVault
 swift build
-cp .build/debug/PodVault PodVault.app/Contents/MacOS/
-codesign --force --deep --sign - PodVault.app
-cp -R PodVault.app /Applications/
+swift test
+```
+
+### macOS App Bundle
+Generate the Xcode project and build the `.app`:
+
+```bash
+xcodegen generate
+xcodebuild -project PodVault.xcodeproj -scheme PodVault -configuration Debug -derivedDataPath build
+```
+
+The built app will be at:
+
+```bash
+build/Build/Products/Debug/PodVault.app
+```
+
+## Install On Mac
+After building:
+
+```bash
+cp -R build/Build/Products/Debug/PodVault.app ~/Applications/PodVault.app
+open ~/Applications/PodVault.app
 ```
 
 ## Keyboard Shortcuts
@@ -77,10 +73,10 @@ cp -R PodVault.app /Applications/
 | Import OPML | ⇧⌘I |
 | Export OPML | ⇧⌘E |
 
+## Project Notes
+- Original redesign plan: [`ARCHITECTURE_REDESIGN.md`](ARCHITECTURE_REDESIGN.md)
+- Current implementation handoff: [`REDESIGN_HANDOFF.md`](REDESIGN_HANDOFF.md)
+
 ## License
 
-MIT License - see [LICENSE](LICENSE) file for details.
-
-## Author
-
-Created by Lance Eaton
+MIT License. See [`LICENSE`](LICENSE).

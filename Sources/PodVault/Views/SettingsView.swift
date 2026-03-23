@@ -310,13 +310,21 @@ struct StorageSettingsView: View {
     
     private func calculateStorageUsage() {
         Task {
-            downloadsSize = await calculateFolderSize(DatabaseManager.downloadsDirectory)
-            savedLibrarySize = await calculateFolderSize(DatabaseManager.savedLibraryDirectory)
-            databaseSize = calculateFileSize(DatabaseManager.appSupportDirectory.appendingPathComponent("podvault.sqlite"))
+            let downloads = await Task.detached {
+                Self.calculateFolderSizeSync(DatabaseManager.downloadsDirectory)
+            }.value
+            let savedLibrary = await Task.detached {
+                Self.calculateFolderSizeSync(DatabaseManager.savedLibraryDirectory)
+            }.value
+            let database = calculateFileSize(DatabaseManager.appSupportDirectory.appendingPathComponent("podvault.sqlite"))
+
+            downloadsSize = downloads
+            savedLibrarySize = savedLibrary
+            databaseSize = database
         }
     }
     
-    private func calculateFolderSize(_ url: URL) async -> String {
+    nonisolated private static func calculateFolderSizeSync(_ url: URL) -> String {
         let fileManager = FileManager.default
         var totalSize: Int64 = 0
         
@@ -421,4 +429,3 @@ struct ShortcutSection: View {
         }
     }
 }
-

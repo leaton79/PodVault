@@ -12,6 +12,7 @@ struct Podcast: Identifiable, Codable, Equatable {
     var link: String?
     var lastSyncAt: Date?
     var autoDownload: Bool
+    var isFavorite: Bool
     var createdAt: Date
     var updatedAt: Date
     
@@ -25,6 +26,7 @@ struct Podcast: Identifiable, Codable, Equatable {
         link: String? = nil,
         lastSyncAt: Date? = nil,
         autoDownload: Bool = true,
+        isFavorite: Bool = false,
         createdAt: Date = Date(),
         updatedAt: Date = Date()
     ) {
@@ -37,6 +39,7 @@ struct Podcast: Identifiable, Codable, Equatable {
         self.link = link
         self.lastSyncAt = lastSyncAt
         self.autoDownload = autoDownload
+        self.isFavorite = isFavorite
         self.createdAt = createdAt
         self.updatedAt = updatedAt
     }
@@ -48,7 +51,7 @@ extension Podcast: TableRecord, FetchableRecord, PersistableRecord {
     
     enum Columns: String, ColumnExpression {
         case id, feedURL, title, author, description, artworkURL, link
-        case lastSyncAt, autoDownload, createdAt, updatedAt
+        case lastSyncAt, autoDownload, isFavorite, createdAt, updatedAt
     }
 }
 

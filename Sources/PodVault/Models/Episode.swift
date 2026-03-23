@@ -28,6 +28,7 @@ struct Episode: Identifiable, Codable, Equatable {
     var downloadProgress: Double  // 0.0 to 1.0, not persisted
     var playbackPosition: Int  // seconds
     var isPlayed: Bool
+    var isFavorite: Bool
     
     // Saved MP3 state
     var isSaved: Bool
@@ -56,6 +57,7 @@ struct Episode: Identifiable, Codable, Equatable {
         downloadProgress: Double = 0,
         playbackPosition: Int = 0,
         isPlayed: Bool = false,
+        isFavorite: Bool = false,
         isSaved: Bool = false,
         savedPath: String? = nil,
         showNotes: String? = nil,
@@ -78,6 +80,7 @@ struct Episode: Identifiable, Codable, Equatable {
         self.downloadProgress = downloadProgress
         self.playbackPosition = playbackPosition
         self.isPlayed = isPlayed
+        self.isFavorite = isFavorite
         self.isSaved = isSaved
         self.savedPath = savedPath
         self.showNotes = showNotes
@@ -100,7 +103,7 @@ extension Episode: TableRecord, FetchableRecord, PersistableRecord {
     enum Columns: String, ColumnExpression {
         case id, podcastId, guid, title, episodeDescription, pubDate
         case duration, audioURL, fileSize, downloadStatus, downloadPath
-        case playbackPosition, isPlayed, isSaved, savedPath
+        case playbackPosition, isPlayed, isFavorite, isSaved, savedPath
         case showNotes, transcript, transcriptURL, createdAt, updatedAt
     }
     
@@ -119,6 +122,7 @@ extension Episode: TableRecord, FetchableRecord, PersistableRecord {
         container["downloadPath"] = downloadPath
         container["playbackPosition"] = playbackPosition
         container["isPlayed"] = isPlayed
+        container["isFavorite"] = isFavorite
         container["isSaved"] = isSaved
         container["savedPath"] = savedPath
         container["showNotes"] = showNotes
@@ -143,6 +147,7 @@ extension Episode: TableRecord, FetchableRecord, PersistableRecord {
         downloadProgress = 0  // Transient, not stored
         playbackPosition = row["playbackPosition"] ?? 0
         isPlayed = row["isPlayed"] ?? false
+        isFavorite = row["isFavorite"] ?? false
         isSaved = row["isSaved"] ?? false
         savedPath = row["savedPath"]
         showNotes = row["showNotes"]

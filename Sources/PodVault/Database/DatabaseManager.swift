@@ -43,17 +43,7 @@ final class DatabaseManager {
         
         let dbPath = podvaultDir.appendingPathComponent("podvault.sqlite")
         
-        var config = Configuration()
-        config.prepareDatabase { db in
-            // Enable WAL mode for better concurrency
-            try db.execute(sql: "PRAGMA journal_mode = WAL")
-            // Enable foreign keys
-            try db.execute(sql: "PRAGMA foreign_keys = ON")
-        }
-        
-        dbPool = try DatabasePool(path: dbPath.path, configuration: config)
-        
-        try migrate()
+        dbPool = try Self.makeDatabasePool(path: dbPath.path)
         
         print("✅ Database initialized at: \(dbPath.path)")
     }
@@ -61,6 +51,10 @@ final class DatabaseManager {
     // MARK: - Migrations
     
     private func migrate() throws {
+        try Self.migrate(database)
+    }
+
+    private static func migrate(_ database: DatabasePool) throws {
         var migrator = DatabaseMigrator()
         
         // Always run migrations in order
@@ -187,7 +181,102 @@ final class DatabaseManager {
             }
         }
         
+        migrator.registerMigration("v3_favorites") { db in
+            try db.alter(table: "podcasts") { t in
+                t.add(column: "isFavorite", .boolean).notNull().defaults(to: false)
+            }
+            
+            try db.alter(table: "episodes") { t in
+                t.add(column: "isFavorite", .boolean).notNull().defaults(to: false)
+            }
+            
+            try db.create(
+                index: "idx_podcasts_favorite",
+                on: "podcasts",
+                columns: ["isFavorite"],
+                condition: Column("isFavorite") == true
+            )
+            
+            try db.create(
+                index: "idx_episodes_favorite",
+                on: "episodes",
+                columns: ["isFavorite"],
+                condition: Column("isFavorite") == true
+            )
+        }
+
+        migrator.registerMigration("v4_fts_sync") { db in
+            try db.execute(sql: """
+                INSERT INTO episodes_fts(rowid, id, title, episodeDescription, showNotes, transcript)
+                SELECT rowid, id, COALESCE(title, ''), COALESCE(episodeDescription, ''), COALESCE(showNotes, ''), COALESCE(transcript, '')
+                FROM episodes
+                """)
+
+            try db.execute(sql: """
+                CREATE TRIGGER episodes_ai AFTER INSERT ON episodes BEGIN
+                    INSERT INTO episodes_fts(rowid, id, title, episodeDescription, showNotes, transcript)
+                    VALUES (new.rowid, new.id, COALESCE(new.title, ''), COALESCE(new.episodeDescription, ''), COALESCE(new.showNotes, ''), COALESCE(new.transcript, ''));
+                END
+                """)
+
+            try db.execute(sql: """
+                CREATE TRIGGER episodes_au AFTER UPDATE ON episodes BEGIN
+                    DELETE FROM episodes_fts WHERE rowid = old.rowid;
+                    INSERT INTO episodes_fts(rowid, id, title, episodeDescription, showNotes, transcript)
+                    VALUES (new.rowid, new.id, COALESCE(new.title, ''), COALESCE(new.episodeDescription, ''), COALESCE(new.showNotes, ''), COALESCE(new.transcript, ''));
+                END
+                """)
+
+            try db.execute(sql: """
+                CREATE TRIGGER episodes_ad AFTER DELETE ON episodes BEGIN
+                    DELETE FROM episodes_fts WHERE rowid = old.rowid;
+                END
+                """)
+
+            try db.execute(sql: """
+                INSERT INTO notes_fts(rowid, episodeId, notes)
+                SELECT rowid, episodeId, COALESCE(notes, '')
+                FROM episode_notes
+                """)
+
+            try db.execute(sql: """
+                CREATE TRIGGER episode_notes_ai AFTER INSERT ON episode_notes BEGIN
+                    INSERT INTO notes_fts(rowid, episodeId, notes)
+                    VALUES (new.rowid, new.episodeId, COALESCE(new.notes, ''));
+                END
+                """)
+
+            try db.execute(sql: """
+                CREATE TRIGGER episode_notes_au AFTER UPDATE ON episode_notes BEGIN
+                    DELETE FROM notes_fts WHERE rowid = old.rowid;
+                    INSERT INTO notes_fts(rowid, episodeId, notes)
+                    VALUES (new.rowid, new.episodeId, COALESCE(new.notes, ''));
+                END
+                """)
+
+            try db.execute(sql: """
+                CREATE TRIGGER episode_notes_ad AFTER DELETE ON episode_notes BEGIN
+                    DELETE FROM notes_fts WHERE rowid = old.rowid;
+                END
+                """)
+        }
+        
         try migrator.migrate(database)
+    }
+
+    static func makeTestDatabase(path: String) throws -> DatabasePool {
+        let database = try makeDatabasePool(path: path)
+        try migrate(database)
+        return database
+    }
+
+    private static func makeDatabasePool(path: String) throws -> DatabasePool {
+        var config = Configuration()
+        config.prepareDatabase { db in
+            try db.execute(sql: "PRAGMA journal_mode = WAL")
+            try db.execute(sql: "PRAGMA foreign_keys = ON")
+        }
+        return try DatabasePool(path: path, configuration: config)
     }
     
     // MARK: - Directory Helpers

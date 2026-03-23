@@ -171,7 +171,7 @@ actor ExportService {
             }
             
             let podcastExport = PodcastExport(
-                title: podcast.title ?? "Untitled",
+                title: podcast.title,
                 author: podcast.author,
                 feedURL: podcast.feedURL,
                 description: podcast.description,

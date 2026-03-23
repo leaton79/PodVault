@@ -53,10 +53,10 @@ struct EpisodeNote: Codable {
     var notes: String
     var updatedAt: Date
     
-    init(episodeId: String, notes: String = "") {
+    init(episodeId: String, notes: String = "", updatedAt: Date = Date()) {
         self.episodeId = episodeId
         self.notes = notes
-        self.updatedAt = Date()
+        self.updatedAt = updatedAt
     }
 }
 

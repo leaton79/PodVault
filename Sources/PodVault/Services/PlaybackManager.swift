@@ -113,6 +113,8 @@ final class PlaybackManager: ObservableObject {
     private var timeObserver: Any?
     private var cancellables = Set<AnyCancellable>()
     private let repository = PodcastRepository()
+    private let appSettings = AppSettings.shared
+    private var volumeBoost: Float = 1.0
     
     /// Timer for periodic position saving
     private var positionSaveTimer: Timer?
@@ -138,6 +140,8 @@ final class PlaybackManager: ObservableObject {
         if savedSkipBack > 0 {
             skipBackwardInterval = savedSkipBack
         }
+        
+        volumeBoost = appSettings.volumeBoost
         
         setupAudioSession()
         setupRemoteCommands()
@@ -231,6 +235,7 @@ final class PlaybackManager: ObservableObject {
         let asset = AVURLAsset(url: audioSource)
         playerItem = AVPlayerItem(asset: asset)
         player = AVPlayer(playerItem: playerItem)
+        player?.volume = volumeBoost
         
         // Observe player item status
         playerItem?.publisher(for: \.status)
@@ -252,10 +257,11 @@ final class PlaybackManager: ObservableObject {
         setupTimeObserver()
         
         // Restore playback position if resuming
-        if episode.playbackPosition > 0 {
-            let position = CMTime(seconds: Double(episode.playbackPosition), preferredTimescale: 1)
+        let restoredPosition = episode.playbackPosition
+        if restoredPosition > 0 {
+            let position = CMTime(seconds: Double(restoredPosition), preferredTimescale: 1)
             await player?.seek(to: position)
-            currentTime = Double(episode.playbackPosition)
+            currentTime = Double(restoredPosition)
         }
         
         // Start position save timer
@@ -367,6 +373,11 @@ final class PlaybackManager: ObservableObject {
         playbackSpeed = Self.availableSpeeds[nextIndex]
     }
     
+    func setVolumeBoost(_ volume: Float) {
+        volumeBoost = volume
+        player?.volume = volume
+    }
+    
     // MARK: - Private Methods
     
     private func resolveAudioSource(for episode: Episode) -> URL? {
@@ -411,18 +422,32 @@ final class PlaybackManager: ObservableObject {
     }
     
     private func handlePlaybackEnded() {
-        print("✅ Playback finished: \(currentEpisode?.title ?? "unknown")")
+        guard let episode = currentEpisode else {
+            stop()
+            return
+        }
+        
+        let podcastTitle = currentPodcast?.title ?? "Unknown Podcast"
+        let playbackDuration = max(currentTime, duration)
+        
+        print("✅ Playback finished: \(episode.title)")
         
         // Mark as played
-        if let episode = currentEpisode {
-            Task {
-                try? await repository.markAsPlayed(episodeId: episode.id, played: true)
-                try? await repository.updatePlaybackPosition(episodeId: episode.id, position: 0)
-            }
+        Task {
+            try? await repository.markAsPlayed(episodeId: episode.id, played: true)
+            try? await repository.updatePlaybackPosition(episodeId: episode.id, position: 0)
         }
         
         // Post notification
-        NotificationCenter.default.post(name: .playbackEnded, object: nil)
+        NotificationCenter.default.post(
+            name: .playbackEnded,
+            object: nil,
+            userInfo: [
+                "episode": episode,
+                "podcastTitle": podcastTitle,
+                "playbackDuration": playbackDuration
+            ]
+        )
         
         stop()
     }
@@ -432,16 +457,20 @@ final class PlaybackManager: ObservableObject {
         let interval = CMTime(seconds: 0.5, preferredTimescale: CMTimeScale(NSEC_PER_SEC))
         
         timeObserver = player?.addPeriodicTimeObserver(forInterval: interval, queue: .main) { [weak self] time in
-            guard let self = self else { return }
-            
-            let seconds = time.seconds
-            if seconds.isFinite {
-                self.currentTime = seconds
-            }
-            
-            // Update duration if not yet set
-            if self.duration == 0, let itemDuration = self.playerItem?.duration.seconds, itemDuration.isFinite {
-                self.duration = itemDuration
+            Task { @MainActor [weak self] in
+                guard let self = self else { return }
+                
+                let seconds = time.seconds
+                if seconds.isFinite {
+                    self.currentTime = seconds
+                }
+                
+                // Update duration if not yet set
+                if self.duration == 0,
+                   let itemDuration = self.playerItem?.duration.seconds,
+                   itemDuration.isFinite {
+                    self.duration = itemDuration
+                }
             }
         }
     }
@@ -470,6 +499,12 @@ final class PlaybackManager: ObservableObject {
         Task {
             try? await repository.updatePlaybackPosition(episodeId: episode.id, position: position)
         }
+
+        NotificationCenter.default.post(
+            name: .playbackPositionChanged,
+            object: nil,
+            userInfo: ["episodeId": episode.id, "position": position]
+        )
     }
     
     private func updateNowPlayingInfo() {

@@ -11,9 +11,7 @@ settings:
   base:
     SWIFT_VERSION: "5.9"
     MACOSX_DEPLOYMENT_TARGET: "14.0"
-    ENABLE_HARDENED_RUNTIME: YES
-    CODE_SIGN_ENTITLEMENTS: PodVault/Resources/PodVault.entitlements
-    INFOPLIST_FILE: PodVault/Resources/Info.plist
+    GENERATE_INFOPLIST_FILE: YES
 
 packages:
   GRDB:
@@ -28,9 +26,9 @@ targets:
     type: application
     platform: macOS
     sources:
-      - PodVault
+      - Sources/PodVault
     resources:
-      - Resources
+      - Sources/PodVault/Resources
     dependencies:
       - package: GRDB
       - package: FeedKit
@@ -38,8 +36,9 @@ targets:
       base:
         PRODUCT_BUNDLE_IDENTIFIER: com.podvault.app
         PRODUCT_NAME: PodVault
-        ASSETCATALOG_COMPILER_APPICON_NAME: AppIcon
         COMBINE_HIDPI_IMAGES: YES
+        INFOPLIST_KEY_CFBundleDisplayName: "PodVault"
+        INFOPLIST_KEY_CFBundleName: "PodVault"
         INFOPLIST_KEY_LSApplicationCategoryType: "public.app-category.entertainment"
         INFOPLIST_KEY_NSHumanReadableCopyright: "Copyright © 2025 PodVault. All rights reserved."
 
@@ -47,7 +46,7 @@ targets:
     type: bundle.unit-test
     platform: macOS
     sources:
-      - PodVaultTests
+      - Tests/PodVaultTests
     dependencies:
       - target: PodVault
     settings:

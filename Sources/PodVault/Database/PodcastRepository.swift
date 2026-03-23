@@ -17,6 +17,15 @@ actor PodcastRepository {
         }
     }
     
+    func getFavoritePodcasts() async throws -> [Podcast] {
+        try await db.read { db in
+            try Podcast
+                .filter(Podcast.Columns.isFavorite == true)
+                .order(Podcast.Columns.title)
+                .fetchAll(db)
+        }
+    }
+    
     func getPodcast(id: String) async throws -> Podcast? {
         try await db.read { db in
             try Podcast.fetchOne(db, key: id)
@@ -30,10 +39,15 @@ actor PodcastRepository {
     }
     
     func savePodcast(_ podcast: Podcast) async throws {
-        var podcast = podcast
-        podcast.updatedAt = Date()
         try await db.write { db in
-            try podcast.save(db)
+            var record = podcast
+            if let existing = try Podcast.fetchOne(db, key: record.id) {
+                record.createdAt = existing.createdAt
+                record.autoDownload = existing.autoDownload
+                record.isFavorite = existing.isFavorite
+            }
+            record.updatedAt = Date()
+            try record.save(db)
         }
     }
     
@@ -59,6 +73,18 @@ actor PodcastRepository {
         }
     }
     
+    func getAllEpisodes(limit: Int? = nil, offset: Int? = nil) async throws -> [Episode] {
+        try await db.read { db in
+            var request = Episode.order(Episode.Columns.pubDate.desc)
+            
+            if let limit = limit {
+                request = request.limit(limit, offset: offset)
+            }
+            
+            return try request.fetchAll(db)
+        }
+    }
+    
     func getEpisode(id: String) async throws -> Episode? {
         try await db.read { db in
             try Episode.fetchOne(db, key: id)
@@ -75,16 +101,29 @@ actor PodcastRepository {
     }
     
     func saveEpisode(_ episode: Episode) async throws {
-        var episode = episode
-        episode.updatedAt = Date()
         try await db.write { db in
-            try episode.save(db)
+            var record = episode
+            record.updatedAt = Date()
+            try record.save(db)
         }
     }
     
     func saveEpisodes(_ episodes: [Episode]) async throws {
         try await db.write { db in
             for var episode in episodes {
+                if let existing = try Episode.fetchOne(db, key: episode.id) {
+                    episode.createdAt = existing.createdAt
+                    episode.downloadStatus = existing.downloadStatus
+                    episode.downloadPath = existing.downloadPath
+                    episode.playbackPosition = existing.playbackPosition
+                    episode.isPlayed = existing.isPlayed
+                    episode.isFavorite = existing.isFavorite
+                    episode.isSaved = existing.isSaved
+                    episode.savedPath = existing.savedPath
+                    episode.showNotes = existing.showNotes ?? episode.showNotes
+                    episode.transcript = existing.transcript ?? episode.transcript
+                    episode.transcriptURL = existing.transcriptURL ?? episode.transcriptURL
+                }
                 episode.updatedAt = Date()
                 try episode.save(db)
             }
@@ -122,6 +161,24 @@ actor PodcastRepository {
             try Episode
                 .filter(Episode.Columns.isSaved == true)
                 .order(Episode.Columns.updatedAt.desc)
+                .fetchAll(db)
+        }
+    }
+    
+    func getDownloadedEpisodes() async throws -> [Episode] {
+        try await db.read { db in
+            try Episode
+                .filter(Episode.Columns.downloadStatus == DownloadStatus.downloaded.rawValue)
+                .order(Episode.Columns.pubDate.desc)
+                .fetchAll(db)
+        }
+    }
+    
+    func getFavoriteEpisodes() async throws -> [Episode] {
+        try await db.read { db in
+            try Episode
+                .filter(Episode.Columns.isFavorite == true)
+                .order(Episode.Columns.pubDate.desc)
                 .fetchAll(db)
         }
     }
@@ -181,13 +238,30 @@ actor PodcastRepository {
             try Episode.fetchCount(db)
         }
     }
+    
+    func setPodcastFavorite(id: String, isFavorite: Bool) async throws {
+        try await db.write { db in
+            try db.execute(
+                sql: "UPDATE podcasts SET isFavorite = ?, updatedAt = ? WHERE id = ?",
+                arguments: [isFavorite, Date(), id]
+            )
+        }
+    }
+    
+    func setEpisodeFavorite(id: String, isFavorite: Bool) async throws {
+        try await db.write { db in
+            try db.execute(
+                sql: "UPDATE episodes SET isFavorite = ?, updatedAt = ? WHERE id = ?",
+                arguments: [isFavorite, Date(), id]
+            )
+        }
+    }
 }
 
 // MARK: - Activity Log
 
 extension PodcastRepository {
     func logActivity(_ log: ActivityLog) async throws {
-        var log = log
         try await db.write { db in
             try log.insert(db)
         }
@@ -234,8 +308,7 @@ extension PodcastRepository {
     
     /// Save notes for an episode
     func saveNote(episodeId: String, notes: String) async throws {
-        var note = EpisodeNote(episodeId: episodeId, notes: notes)
-        note.updatedAt = Date()
+        let note = EpisodeNote(episodeId: episodeId, notes: notes, updatedAt: Date())
         
         try await db.write { db in
             // Use INSERT OR REPLACE for upsert
@@ -311,11 +384,11 @@ extension PodcastRepository {
     
     /// Create a new tag
     func createTag(name: String, color: String? = nil) async throws -> Tag {
-        var tag = Tag(name: name, color: color)
         try await db.write { db in
+            var tag = Tag(name: name, color: color)
             try tag.insert(db)
+            return tag
         }
-        return tag
     }
     
     /// Delete a tag (also removes from all episodes)

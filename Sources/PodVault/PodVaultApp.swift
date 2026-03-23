@@ -1,6 +1,5 @@
 import SwiftUI
 import AppKit
-import AVFoundation
 
 // MARK: - Theme System
 
@@ -184,8 +183,6 @@ class AppSettings: ObservableObject {
     @Published var theme: AppTheme = .system
     @Published var playbackSpeed: Float = 1.0
     @Published var fontSize: FontSize = .medium
-    @Published var playbackPositions: [String: Double] = [:]
-    @Published var playedEpisodes: Set<String> = []
     @Published var volumeBoost: Float = 1.0
     @Published var continuousPlayback: Bool = false
     @Published var playbackHistory: [PlayedItem] = []
@@ -208,8 +205,6 @@ class AppSettings: ObservableObject {
             theme = decoded.theme
             playbackSpeed = decoded.playbackSpeed
             fontSize = decoded.fontSize ?? .medium
-            playbackPositions = decoded.playbackPositions ?? [:]
-            playedEpisodes = Set(decoded.playedEpisodes ?? [])
             volumeBoost = decoded.volumeBoost ?? 1.0
             continuousPlayback = decoded.continuousPlayback ?? false
             playbackHistory = decoded.playbackHistory ?? []
@@ -222,7 +217,6 @@ class AppSettings: ObservableObject {
     func save() {
         let data = SettingsData(
             theme: theme, playbackSpeed: playbackSpeed, fontSize: fontSize,
-            playbackPositions: playbackPositions, playedEpisodes: Array(playedEpisodes),
             volumeBoost: volumeBoost, continuousPlayback: continuousPlayback,
             playbackHistory: playbackHistory, podcastCategories: podcastCategories,
             episodeNotes: episodeNotes, listeningStats: listeningStats
@@ -231,26 +225,6 @@ class AppSettings: ObservableObject {
             try? encoded.write(to: settingsURL)
         }
     }
-    
-    func savePosition(for episodeId: String, position: Double) {
-        playbackPositions[episodeId] = position
-        save()
-    }
-    
-    func getPosition(for episodeId: String) -> Double { playbackPositions[episodeId] ?? 0 }
-    
-    func markAsPlayed(_ episodeId: String) {
-        playedEpisodes.insert(episodeId)
-        playbackPositions.removeValue(forKey: episodeId)
-        save()
-    }
-    
-    func markAsUnplayed(_ episodeId: String) {
-        playedEpisodes.remove(episodeId)
-        save()
-    }
-    
-    func isPlayed(_ episodeId: String) -> Bool { playedEpisodes.contains(episodeId) }
     
     func addToHistory(_ episode: Episode, podcastTitle: String) {
         let item = PlayedItem(episodeId: episode.id, episodeTitle: episode.title, podcastTitle: podcastTitle, playedAt: Date())
@@ -316,8 +290,6 @@ struct SettingsData: Codable {
     var theme: AppTheme
     var playbackSpeed: Float
     var fontSize: FontSize?
-    var playbackPositions: [String: Double]?
-    var playedEpisodes: [String]?
     var volumeBoost: Float?
     var continuousPlayback: Bool?
     var playbackHistory: [PlayedItem]?
@@ -447,6 +419,54 @@ extension Notification.Name {
     static let speedChanged = Notification.Name("speedChanged")
 }
 
+enum LibraryView: Equatable {
+    case none
+    case continueListening
+    case downloads
+    case favoritePodcasts
+    case favoriteEpisodes
+    case allEpisodes
+    case history
+    case category(String)
+}
+
+struct RefreshSummary: Equatable {
+    let title: String
+    let subtitle: String
+    let failedFeeds: [String]
+
+    static func libraryRefresh(refreshedFeedCount: Int, newEpisodeCount: Int, failedFeeds: [String]) -> RefreshSummary {
+        let title = failedFeeds.isEmpty ? "Refresh complete" : "Refresh finished with issues"
+        let feedText = refreshedFeedCount == 1 ? "1 feed" : "\(refreshedFeedCount) feeds"
+        let episodeText = newEpisodeCount == 1 ? "1 new episode" : "\(newEpisodeCount) new episodes"
+        let subtitle: String
+        if failedFeeds.isEmpty {
+            subtitle = "\(feedText), \(episodeText)"
+        } else {
+            let failureText = failedFeeds.count == 1 ? "1 failed" : "\(failedFeeds.count) failed"
+            subtitle = "\(feedText), \(episodeText), \(failureText)"
+        }
+        return RefreshSummary(title: title, subtitle: subtitle, failedFeeds: failedFeeds)
+    }
+
+    static func singlePodcastSuccess(title: String, newEpisodeCount: Int) -> RefreshSummary {
+        let episodeText = newEpisodeCount == 1 ? "1 new episode" : "\(newEpisodeCount) new episodes"
+        return RefreshSummary(
+            title: "Podcast refreshed",
+            subtitle: "\(title), \(episodeText)",
+            failedFeeds: []
+        )
+    }
+
+    static func singlePodcastFailure(title: String) -> RefreshSummary {
+        RefreshSummary(
+            title: "Podcast refresh failed",
+            subtitle: title,
+            failedFeeds: [title]
+        )
+    }
+}
+
 // MARK: - Content View
 
 struct ContentView: View {
@@ -454,46 +474,25 @@ struct ContentView: View {
     @Environment(\.colorScheme) var colorScheme
     @Binding var showMiniPlayer: Bool
     @Binding var showStats: Bool
+    @StateObject private var playbackManager = PlaybackManager.shared
+    @StateObject private var downloadManager = DownloadManager.shared
+    @StateObject private var library = LibraryViewModel()
+    private let libraryService = LibraryService()
     
-    @State private var podcasts: [Podcast] = []
-    @State private var episodes: [Episode] = []
-    @State private var allEpisodes: [Episode] = []
-    @State private var selectedPodcastId: String?
-    @State private var selectedEpisodeId: String?
     @State private var showAddSheet = false
     @State private var feedURL = ""
     @State private var isLoading = false
     @State private var errorMessage: String?
-    @State private var downloadedEpisodesList: [Episode] = []
-    @State private var currentView: LibraryView = .none
-    enum LibraryView: Equatable { case none, downloads, favoritePodcasts, favoriteEpisodes, allEpisodes, history, category(String) }
-    @State private var favoritePodcastIds: Set<String> = []
-    @State private var favoriteEpisodeIds: Set<String> = []
-    @State private var favoriteEpisodesList: [Episode] = []
-    @State private var player: AVPlayer?
-    @State private var isPlaying = false
-    @State private var currentlyPlayingEpisode: Episode?
-    @State private var currentPodcastTitle: String = ""
-    @State private var currentTime: Double = 0
-    @State private var duration: Double = 0
-    @State private var downloadingEpisodes: Set<String> = []
-    @State private var downloadedEpisodes: Set<String> = []
     @State private var sidebarWidth: CGFloat = 220
     @State private var episodesWidth: CGFloat = 320
-    @State private var searchText: String = ""
-    @State private var podcastSearchText: String = ""
-    @State private var isRefreshing = false
-    @State private var playbackEndObserver: Any?
     @State private var playQueue: [Episode] = []
-    @State private var episodeFilter: EpisodeFilter = .all
-    @State private var episodeSort: EpisodeSort = .newestFirst
     @State private var showCategorySheet = false
     @State private var selectedPodcastForCategory: Podcast?
     @State private var newCategoryName = ""
     @State private var showNoteEditor = false
     @State private var currentNote = ""
     @State private var miniPlayerWindow: MiniPlayerWindow?
-    @State private var lastPositionSaveTime: Date = Date()
+    @State private var refreshSummary: RefreshSummary?
     
     let playbackSpeeds: [Float] = [0.5, 0.75, 1.0, 1.25, 1.5, 1.75, 2.0]
     
@@ -507,310 +506,247 @@ struct ContentView: View {
     var dividerColor: Color { theme.dividerColor(for: colorScheme) }
     var textColor: Color { theme.textColor(for: colorScheme) }
     var secondaryText: Color { theme.secondaryText(for: colorScheme) }
+    var currentlyPlayingEpisode: Episode? { playbackManager.currentEpisode }
+    var isPlaying: Bool { playbackManager.isPlaying }
+    var currentTime: Double { playbackManager.currentTime }
+    var duration: Double { playbackManager.duration }
     
-    var selectedPodcast: Podcast? { podcasts.first { $0.id == selectedPodcastId } }
-    
-    var filteredPodcasts: [Podcast] {
-        if podcastSearchText.isEmpty { return podcasts }
-        return podcasts.filter { $0.title.localizedCaseInsensitiveContains(podcastSearchText) }
-    }
-    
-    var selectedEpisode: Episode? {
-        let list: [Episode]
-        switch currentView {
-        case .downloads: list = downloadedEpisodesList
-        case .favoriteEpisodes: list = favoriteEpisodesList
-        case .allEpisodes: list = allEpisodes
-        default: list = episodes
-        }
-        return list.first { $0.id == selectedEpisodeId }
-    }
-    
-    var displayedEpisodes: [Episode] {
-        switch currentView {
-        case .downloads: return downloadedEpisodesList
-        case .favoriteEpisodes: return favoriteEpisodesList
-        case .allEpisodes: return allEpisodes
-        default: return episodes
-        }
-    }
-    
+    var selectedPodcast: Podcast? { library.selectedPodcast }
+    var sidebarSelectionKey: String { library.sidebarSelectionKey }
+    var filteredPodcasts: [Podcast] { library.filteredPodcasts }
+    var selectedEpisode: Episode? { library.selectedEpisode() }
+    var displayedEpisodes: [Episode] { library.displayedEpisodes() }
     var filteredAndSortedEpisodes: [Episode] {
-        var result = displayedEpisodes
-        
-        switch episodeFilter {
-        case .all: break
-        case .unplayed: result = result.filter { !settings.isPlayed($0.id) && settings.getPosition(for: $0.id) == 0 }
-        case .inProgress: result = result.filter { settings.getPosition(for: $0.id) > 0 && !settings.isPlayed($0.id) }
-        case .downloaded: result = result.filter { downloadedEpisodes.contains($0.id) }
-        case .favorites: result = result.filter { favoriteEpisodeIds.contains($0.id) }
-        }
-        
-        if !searchText.isEmpty {
-            result = result.filter {
-                $0.title.localizedCaseInsensitiveContains(searchText) ||
-                ($0.episodeDescription?.localizedCaseInsensitiveContains(searchText) ?? false)
-            }
-        }
-        
-        switch episodeSort {
-        case .newestFirst: result.sort { ($0.pubDate ?? .distantPast) > ($1.pubDate ?? .distantPast) }
-        case .oldestFirst: result.sort { ($0.pubDate ?? .distantPast) < ($1.pubDate ?? .distantPast) }
-        case .longestFirst: result.sort { ($0.duration ?? 0) > ($1.duration ?? 0) }
-        case .shortestFirst: result.sort { ($0.duration ?? 0) < ($1.duration ?? 0) }
-        case .titleAZ: result.sort { $0.title.localizedCompare($1.title) == .orderedAscending }
-        case .titleZA: result.sort { $0.title.localizedCompare($1.title) == .orderedDescending }
-        }
-        
-        return result
+        library.filteredAndSortedEpisodes(
+            isPlayed: effectiveIsPlayed,
+            resumePosition: effectiveResumePosition,
+            downloadedEpisodeIds: library.downloadedEpisodeIds,
+            favoriteEpisodeIds: library.favoriteEpisodeIds
+        )
     }
     
-    var favoritePodcasts: [Podcast] { podcasts.filter { favoritePodcastIds.contains($0.id) } }
-    
-    var listTitle: String {
-        switch currentView {
-        case .downloads: return "Downloads"
-        case .favoritePodcasts: return "Favorite Podcasts"
-        case .favoriteEpisodes: return "Favorite Episodes"
-        case .allEpisodes: return "All Episodes"
-        case .history: return "History"
-        case .category(let cat): return cat
-        case .none: return selectedPodcast?.title ?? "Episodes"
-        }
-    }
-    
-    var shouldShowEpisodeList: Bool {
-        currentView == .downloads || currentView == .favoriteEpisodes || currentView == .allEpisodes || selectedPodcast != nil
-    }
+    var favoritePodcasts: [Podcast] { library.podcasts.filter { library.favoritePodcastIds.contains($0.id) } }
+    var listTitle: String { library.listTitle }
+    var shouldShowEpisodeList: Bool { library.shouldShowEpisodeList }
     
     var hasNextEpisode: Bool {
         if !playQueue.isEmpty { return true }
         guard let current = currentlyPlayingEpisode else { return false }
-        let feedEpisodes = episodes.sorted { ($0.pubDate ?? .distantPast) > ($1.pubDate ?? .distantPast) }
+        let feedEpisodes = library.episodes.sorted { ($0.pubDate ?? .distantPast) > ($1.pubDate ?? .distantPast) }
         if let index = feedEpisodes.firstIndex(where: { $0.id == current.id }) {
             return index + 1 < feedEpisodes.count
         }
         return false
     }
+
+    func effectiveIsPlayed(_ episode: Episode) -> Bool {
+        episode.isPlayed
+    }
+
+    func effectiveResumePosition(_ episode: Episode) -> Double {
+        if currentlyPlayingEpisode?.id == episode.id {
+            return max(currentTime, Double(episode.playbackPosition))
+        }
+        return Double(episode.playbackPosition)
+    }
     
     var body: some View {
-        GeometryReader { geometry in
-            HStack(spacing: 0) {
-                sidebarView.frame(width: sidebarWidth)
-                
-                Rectangle().fill(dividerColor).frame(width: 1)
-                    .contentShape(Rectangle().size(width: 8, height: geometry.size.height))
-                    .gesture(DragGesture().onChanged { v in sidebarWidth = max(180, min(350, sidebarWidth + v.translation.width)) })
-                    .onHover { h in if h { NSCursor.resizeLeftRight.push() } else { NSCursor.pop() } }
-                
-                episodesView.frame(width: episodesWidth)
-                
-                Rectangle().fill(dividerColor).frame(width: 1)
-                    .contentShape(Rectangle().size(width: 8, height: geometry.size.height))
-                    .gesture(DragGesture().onChanged { v in episodesWidth = max(250, min(500, episodesWidth + v.translation.width)) })
-                    .onHover { h in if h { NSCursor.resizeLeftRight.push() } else { NSCursor.pop() } }
-                
-                VStack(spacing: 0) {
-                    detailView
-                    Rectangle().fill(dividerColor).frame(height: 1)
-                    queueView
+        contentBody
+    }
+
+    var rootLayout: AnyView {
+        AnyView(
+            GeometryReader { geometry in
+                mainLayout(geometry: geometry)
+            }
+        )
+    }
+
+    var framedRootLayout: AnyView {
+        AnyView(rootLayout.frame(minWidth: 1000, minHeight: 700))
+    }
+
+    var overlayRootLayout: AnyView {
+        AnyView(
+            framedRootLayout.overlay(alignment: .bottom) {
+                if let episode = currentlyPlayingEpisode {
+                    nowPlayingBar(episode: episode)
                 }
-                .frame(maxWidth: .infinity)
             }
-        }
-        .frame(minWidth: 1000, minHeight: 700)
-        .overlay(alignment: .bottom) {
-            if let episode = currentlyPlayingEpisode {
-                nowPlayingBar(episode: episode)
+        )
+    }
+
+    var sheetRootLayout: AnyView {
+        AnyView(
+            overlayRootLayout
+                .background(mainBg)
+                .sheet(isPresented: $showAddSheet) { addPodcastSheet }
+                .sheet(isPresented: $showCategorySheet) { categorySheet }
+                .sheet(isPresented: $showNoteEditor) { noteEditorSheet }
+                .sheet(isPresented: $showStats) { statsView }
+        )
+    }
+
+    var lifecycleRootLayout: AnyView {
+        AnyView(
+            sheetRootLayout.task {
+                await loadPodcasts()
+                await libraryService.validateDownloadedEpisodes()
+                await loadDownloadedEpisodesList()
+                _ = await library.loadInProgressEpisodesList()
+                await loadFavorites()
+                playbackManager.playbackSpeed = settings.playbackSpeed
+                playbackManager.setVolumeBoost(settings.volumeBoost)
             }
+        )
+    }
+
+    var notificationRootLayout: AnyView {
+        AnyView(
+            lifecycleRootLayout
+                .onReceive(NotificationCenter.default.publisher(for: .importOPML)) { _ in importOPML() }
+                .onReceive(NotificationCenter.default.publisher(for: .exportOPML)) { _ in exportOPML() }
+                .onReceive(NotificationCenter.default.publisher(for: .exportHistory)) { _ in exportHistory() }
+                .onReceive(NotificationCenter.default.publisher(for: .togglePlayback)) { _ in togglePlayPause() }
+                .onReceive(NotificationCenter.default.publisher(for: .playNext)) { _ in playNextEpisode() }
+                .onReceive(NotificationCenter.default.publisher(for: .skipForward)) { _ in skipForward() }
+                .onReceive(NotificationCenter.default.publisher(for: .skipBack)) { _ in skipBackward() }
+                .onReceive(NotificationCenter.default.publisher(for: .volumeUp)) { _ in adjustVolume(by: 0.1) }
+                .onReceive(NotificationCenter.default.publisher(for: .volumeDown)) { _ in adjustVolume(by: -0.1) }
+                .onReceive(NotificationCenter.default.publisher(for: .speedChanged)) { _ in
+                    playbackManager.playbackSpeed = settings.playbackSpeed
+                }
+                .onReceive(NotificationCenter.default.publisher(for: .playbackEnded)) { notification in
+                    handlePlaybackEnded(notification)
+                }
+                .onReceive(NotificationCenter.default.publisher(for: .playbackPositionChanged)) { _ in
+                    Task { _ = await library.loadInProgressEpisodesList() }
+                }
+                .onReceive(NotificationCenter.default.publisher(for: .downloadCompleted)) { notification in
+                    handleDownloadCompleted(notification)
+                }
+        )
+    }
+
+    var contentBody: some View {
+        notificationRootLayout
+            .onChange(of: showMiniPlayer) { _, show in
+                if show { openMiniPlayer() } else { closeMiniPlayer() }
+            }
+            .onChange(of: library.searchText) { _, _ in
+                Task { await library.refreshSearchResults() }
+            }
+            .onChange(of: currentlyPlayingEpisode?.id) { _, _ in updateMiniPlayer() }
+            .onChange(of: isPlaying) { _, _ in updateMiniPlayer() }
+            .onChange(of: currentTime) { _, _ in updateMiniPlayer() }
+    }
+
+    func mainLayout(geometry: GeometryProxy) -> some View {
+        HStack(spacing: 0) {
+            sidebarView.frame(width: sidebarWidth)
+
+            Rectangle().fill(dividerColor).frame(width: 1)
+                .contentShape(Rectangle().size(width: 8, height: geometry.size.height))
+                .gesture(DragGesture().onChanged { v in sidebarWidth = max(180, min(350, sidebarWidth + v.translation.width)) })
+                .onHover { h in if h { NSCursor.resizeLeftRight.push() } else { NSCursor.pop() } }
+
+            episodesView.frame(width: episodesWidth)
+
+            Rectangle().fill(dividerColor).frame(width: 1)
+                .contentShape(Rectangle().size(width: 8, height: geometry.size.height))
+                .gesture(DragGesture().onChanged { v in episodesWidth = max(250, min(500, episodesWidth + v.translation.width)) })
+                .onHover { h in if h { NSCursor.resizeLeftRight.push() } else { NSCursor.pop() } }
+
+            VStack(spacing: 0) {
+                detailView
+                Rectangle().fill(dividerColor).frame(height: 1)
+                queueView
+            }
+            .frame(maxWidth: .infinity)
         }
-        .background(mainBg)
-        .sheet(isPresented: $showAddSheet) { addPodcastSheet }
-        .sheet(isPresented: $showCategorySheet) { categorySheet }
-        .sheet(isPresented: $showNoteEditor) { noteEditorSheet }
-        .sheet(isPresented: $showStats) { statsView }
-        .task {
-            await loadPodcasts()
-            loadDownloadedEpisodes()
-            loadFavorites()
-        }
-        .onReceive(NotificationCenter.default.publisher(for: .importOPML)) { _ in importOPML() }
-        .onReceive(NotificationCenter.default.publisher(for: .exportOPML)) { _ in exportOPML() }
-        .onReceive(NotificationCenter.default.publisher(for: .exportHistory)) { _ in exportHistory() }
-        .onReceive(NotificationCenter.default.publisher(for: .togglePlayback)) { _ in togglePlayPause() }
-        .onReceive(NotificationCenter.default.publisher(for: .playNext)) { _ in playNextEpisode() }
-        .onReceive(NotificationCenter.default.publisher(for: .skipForward)) { _ in skipForward() }
-        .onReceive(NotificationCenter.default.publisher(for: .skipBack)) { _ in skipBackward() }
-        .onReceive(NotificationCenter.default.publisher(for: .volumeUp)) { _ in adjustVolume(by: 0.1) }
-        .onReceive(NotificationCenter.default.publisher(for: .volumeDown)) { _ in adjustVolume(by: -0.1) }
-        .onReceive(NotificationCenter.default.publisher(for: .speedChanged)) { _ in if isPlaying { player?.rate = settings.playbackSpeed } }
-        .onChange(of: showMiniPlayer) { show in
-            if show { openMiniPlayer() } else { closeMiniPlayer() }
-        }
-        .onChange(of: currentlyPlayingEpisode?.id) { _ in updateMiniPlayer() }
-        .onChange(of: isPlaying) { _ in updateMiniPlayer() }
-        .onChange(of: currentTime) { _ in updateMiniPlayer() }
     }
     
     // MARK: - Sidebar
     var sidebarView: some View {
-        VStack(alignment: .leading, spacing: 0) {
-            HStack {
-                Text("Library").font(.system(size: 16 * scale, weight: .semibold)).foregroundColor(textColor)
-                Spacer()
-                if isRefreshing {
-                    ProgressView().scaleEffect(0.6)
-                } else {
-                    Button { Task { await refreshAllFeeds() } } label: {
-                        Image(systemName: "arrow.clockwise").font(.system(size: 14)).foregroundColor(theme.accentColor)
-                    }
-                    .buttonStyle(.plain).help("Refresh all feeds")
+        let categoryCounts = Dictionary(uniqueKeysWithValues: settings.allCategories.map { category in
+            (category, library.podcasts.filter { settings.getCategory(for: $0.id) == category }.count)
+        })
+        
+        return AnyView(
+            LibrarySidebarView(
+                podcastSearchText: Binding(
+                    get: { library.podcastSearchText },
+                    set: { library.podcastSearchText = $0 }
+                ),
+                isRefreshing: library.isRefreshing,
+                syncSummaryTitle: refreshSummary?.title,
+                syncSummarySubtitle: refreshSummary?.subtitle,
+                syncSummaryFailures: refreshSummary?.failedFeeds ?? [],
+                continueListeningCount: library.inProgressEpisodesList.count,
+                historyCount: settings.playbackHistory.count,
+                downloadedCount: library.downloadedEpisodeIds.count,
+                favoritePodcastCount: library.favoritePodcastIds.count,
+                favoriteEpisodeCount: library.favoriteEpisodeIds.count,
+                categories: settings.allCategories,
+                categoryCounts: categoryCounts,
+                podcasts: filteredPodcasts,
+                selectedPodcastId: library.selectedPodcastId,
+                currentView: sidebarSelectionKey,
+                scale: scale,
+                accentColor: theme.accentColor,
+                buttonBg: theme.buttonBg,
+                buttonText: theme.buttonText,
+                sidebarBg: sidebarBg,
+                dividerColor: dividerColor,
+                textColor: textColor,
+                secondaryText: secondaryText,
+                onRefreshAll: {
+                    Task { await refreshAllFeeds() }
+                },
+                onSelectAllEpisodes: {
+                    Task { await library.selectAllEpisodes() }
+                },
+                onSelectContinueListening: {
+                    Task { await library.selectContinueListening() }
+                },
+                onSelectHistory: {
+                    library.selectHistory()
+                },
+                onSelectDownloads: {
+                    Task { await library.selectDownloads() }
+                },
+                onSelectFavoritePodcasts: {
+                    library.selectFavoritePodcasts()
+                },
+                onSelectFavoriteEpisodes: {
+                    Task { await library.selectFavoriteEpisodes() }
+                },
+                onSelectCategory: { category in
+                    library.selectCategory(category)
+                },
+                onSelectPodcast: { podcast in
+                    Task { await library.selectPodcast(podcast) }
+                },
+                onRefreshPodcast: { podcast in
+                    Task { await refreshFeed(podcast) }
+                },
+                onToggleFavoritePodcast: toggleFavoritePodcast,
+                onSetCategoryForPodcast: { podcast in
+                    selectedPodcastForCategory = podcast
+                    newCategoryName = settings.getCategory(for: podcast.id)
+                    showCategorySheet = true
+                },
+                onDeletePodcast: { podcast in
+                    Task { await deletePodcast(podcast) }
+                },
+                onShowAddPodcast: {
+                    showAddSheet = true
+                },
+                onDismissSyncSummary: {
+                    refreshSummary = nil
                 }
-            }
-            .padding()
-            
-            ScrollView {
-                VStack(spacing: 4) {
-                    sidebarButton(icon: "rectangle.stack.fill", iconColor: theme.accentColor, title: "All Episodes", count: nil, isSelected: currentView == .allEpisodes) {
-                        currentView = .allEpisodes; selectedPodcastId = nil; selectedEpisodeId = nil; searchText = ""
-                        Task { await loadAllEpisodes() }
-                    }
-                    
-                    sidebarButton(icon: "clock.fill", iconColor: .orange, title: "History", count: settings.playbackHistory.count, isSelected: currentView == .history) {
-                        currentView = .history; selectedPodcastId = nil; selectedEpisodeId = nil; searchText = ""
-                    }
-                    
-                    sidebarButton(icon: "arrow.down.circle.fill", iconColor: .green, title: "Downloads", count: downloadedEpisodes.count, isSelected: currentView == .downloads) {
-                        currentView = .downloads; selectedPodcastId = nil; selectedEpisodeId = nil; searchText = ""
-                        Task { await loadDownloadedEpisodesList() }
-                    }
-                    
-                    sidebarButton(icon: "star.fill", iconColor: .yellow, title: "Favorite Podcasts", count: favoritePodcastIds.count, isSelected: currentView == .favoritePodcasts) {
-                        currentView = .favoritePodcasts; selectedPodcastId = nil; selectedEpisodeId = nil; searchText = ""
-                    }
-                    
-                    sidebarButton(icon: "heart.fill", iconColor: .pink, title: "Favorite Episodes", count: favoriteEpisodeIds.count, isSelected: currentView == .favoriteEpisodes) {
-                        currentView = .favoriteEpisodes; selectedPodcastId = nil; selectedEpisodeId = nil; searchText = ""
-                        Task { await loadFavoriteEpisodesList() }
-                    }
-                    
-                    Rectangle().fill(dividerColor).frame(height: 1).padding(.vertical, 8).padding(.horizontal, 12)
-                    
-                    if !settings.allCategories.isEmpty {
-                        Text("Categories").font(.system(size: 11 * scale, weight: .medium)).foregroundColor(secondaryText)
-                            .frame(maxWidth: .infinity, alignment: .leading).padding(.horizontal, 12).padding(.bottom, 4)
-                        
-                        ForEach(settings.allCategories, id: \.self) { category in
-                            let count = podcasts.filter { settings.getCategory(for: $0.id) == category }.count
-                            sidebarButton(icon: "folder.fill", iconColor: theme.accentColor, title: category, count: count, isSelected: currentView == .category(category)) {
-                                currentView = .category(category); selectedPodcastId = nil; selectedEpisodeId = nil; searchText = ""
-                            }
-                        }
-                        
-                        Rectangle().fill(dividerColor).frame(height: 1).padding(.vertical, 8).padding(.horizontal, 12)
-                    }
-                    
-                    Text("Podcasts").font(.system(size: 11 * scale, weight: .medium)).foregroundColor(secondaryText)
-                        .frame(maxWidth: .infinity, alignment: .leading).padding(.horizontal, 12).padding(.bottom, 4)
-                    
-                    HStack {
-                        Image(systemName: "magnifyingglass").foregroundColor(secondaryText).font(.system(size: 11 * scale))
-                        TextField("Search podcasts...", text: $podcastSearchText)
-                            .textFieldStyle(.plain).font(.system(size: 12 * scale)).foregroundColor(textColor)
-                        if !podcastSearchText.isEmpty {
-                            Button { podcastSearchText = "" } label: {
-                                Image(systemName: "xmark.circle.fill").foregroundColor(secondaryText).font(.system(size: 11))
-                            }.buttonStyle(.plain)
-                        }
-                    }
-                    .padding(.horizontal, 8).padding(.vertical, 5)
-                    .background(dividerColor.opacity(0.5))
-                    .cornerRadius(5)
-                    .padding(.horizontal, 12).padding(.bottom, 6)
-                    
-                    ForEach(filteredPodcasts, id: \.id) { podcast in
-                        podcastRow(podcast: podcast)
-                    }
-                }
-                .padding(.horizontal, 8)
-            }
-            
-            Rectangle().fill(dividerColor).frame(height: 1)
-            
-            // Add Podcast Button
-            Button { showAddSheet = true } label: {
-                Label("Add Podcast", systemImage: "plus")
-                    .font(.system(size: 14 * scale, weight: .medium))
-                    .foregroundColor(theme.buttonText)
-                    .frame(maxWidth: .infinity)
-                    .padding(.vertical, 10)
-                    .background(theme.buttonBg)
-                    .cornerRadius(8)
-            }
-            .buttonStyle(.plain)
-            .padding(12)
-        }
-        .background(sidebarBg)
-    }
-    
-    func podcastRow(podcast: Podcast) -> some View {
-        Button {
-            currentView = .none; selectedPodcastId = podcast.id; selectedEpisodeId = nil; searchText = ""
-            Task { await loadEpisodes(for: podcast) }
-        } label: {
-            HStack(spacing: 8) {
-                if let artworkURL = podcast.artworkURL, let url = URL(string: artworkURL) {
-                    AsyncImage(url: url) { image in
-                        image.resizable().aspectRatio(contentMode: .fill)
-                    } placeholder: {
-                        Image(systemName: "mic.fill").foregroundColor(theme.accentColor)
-                    }
-                    .frame(width: 28, height: 28)
-                    .cornerRadius(4)
-                } else {
-                    Image(systemName: "mic.fill").foregroundColor(theme.accentColor).font(.system(size: 14 * scale))
-                        .frame(width: 28, height: 28)
-                }
-                
-                Text(podcast.title).font(.system(size: 13 * scale)).foregroundColor(textColor).lineLimit(1)
-                Spacer()
-                if favoritePodcastIds.contains(podcast.id) {
-                    Image(systemName: "star.fill").foregroundColor(.yellow).font(.system(size: 10 * scale))
-                }
-            }
-            .padding(.horizontal, 10).padding(.vertical, 6)
-            .background(selectedPodcastId == podcast.id && currentView == .none ? theme.accentColor.opacity(0.3) : Color.clear)
-            .cornerRadius(6)
-        }
-        .buttonStyle(.plain)
-        .contextMenu {
-            Button { Task { await refreshFeed(podcast) } } label: { Label("Refresh Feed", systemImage: "arrow.clockwise") }
-            Button { toggleFavoritePodcast(podcast) } label: {
-                Label(favoritePodcastIds.contains(podcast.id) ? "Remove from Favorites" : "Add to Favorites",
-                      systemImage: favoritePodcastIds.contains(podcast.id) ? "star.slash" : "star")
-            }
-            Divider()
-            Button { selectedPodcastForCategory = podcast; newCategoryName = settings.getCategory(for: podcast.id); showCategorySheet = true } label: {
-                Label("Set Category...", systemImage: "folder")
-            }
-            Divider()
-            Button(role: .destructive) { Task { await deletePodcast(podcast) } } label: { Label("Delete Podcast", systemImage: "trash") }
-        }
-    }
-    
-    func sidebarButton(icon: String, iconColor: Color, title: String, count: Int?, isSelected: Bool, action: @escaping () -> Void) -> some View {
-        Button(action: action) {
-            HStack(spacing: 10) {
-                Image(systemName: icon).foregroundColor(iconColor).font(.system(size: 14 * scale))
-                Text(title).font(.system(size: 14 * scale)).foregroundColor(textColor)
-                Spacer()
-                if let c = count { Text("\(c)").font(.system(size: 12 * scale)).foregroundColor(secondaryText) }
-            }
-            .padding(.horizontal, 12).padding(.vertical, 8)
-            .background(isSelected ? theme.accentColor.opacity(0.3) : Color.clear)
-            .cornerRadius(8)
-        }
-        .buttonStyle(.plain)
+            )
+        )
     }
     
     // MARK: - Episodes View
@@ -827,87 +763,37 @@ struct ContentView: View {
             }
             .padding()
             
-            if shouldShowEpisodeList {
-                HStack(spacing: 8) {
-                    Menu {
-                        ForEach(EpisodeFilter.allCases, id: \.self) { filter in
-                            Button { episodeFilter = filter } label: {
-                                if episodeFilter == filter { Text("✓ " + filter.rawValue) }
-                                else { Text("    " + filter.rawValue) }
-                            }
-                        }
-                    } label: {
-                        HStack(spacing: 4) {
-                            Image(systemName: "line.3.horizontal.decrease.circle").font(.system(size: 11))
-                            Text(episodeFilter.rawValue).font(.system(size: 11 * scale))
-                        }
-                        .foregroundColor(episodeFilter == .all ? secondaryText : theme.accentColor)
-                    }
-                    .menuStyle(.borderlessButton)
-                    
-                    Menu {
-                        ForEach(EpisodeSort.allCases, id: \.self) { sort in
-                            Button { episodeSort = sort } label: {
-                                if episodeSort == sort { Text("✓ " + sort.rawValue) }
-                                else { Text("    " + sort.rawValue) }
-                            }
-                        }
-                    } label: {
-                        HStack(spacing: 4) {
-                            Image(systemName: "arrow.up.arrow.down").font(.system(size: 11))
-                            Text(episodeSort.rawValue).font(.system(size: 11 * scale))
-                        }
-                        .foregroundColor(secondaryText)
-                    }
-                    .menuStyle(.borderlessButton)
-                    
-                    Spacer()
-                }
-                .padding(.horizontal, 12).padding(.bottom, 6)
-                
-                HStack {
-                    Image(systemName: "magnifyingglass").foregroundColor(secondaryText).font(.system(size: 12 * scale))
-                    TextField("Search episodes...", text: $searchText)
-                        .textFieldStyle(.plain).font(.system(size: 13 * scale)).foregroundColor(textColor)
-                    if !searchText.isEmpty {
-                        Button { searchText = "" } label: {
-                            Image(systemName: "xmark.circle.fill").foregroundColor(secondaryText).font(.system(size: 12))
-                        }.buttonStyle(.plain)
-                    }
-                }
-                .padding(.horizontal, 10).padding(.vertical, 6)
-                .background(dividerColor.opacity(0.5))
-                .cornerRadius(6)
-                .padding(.horizontal, 12).padding(.bottom, 8)
-            }
-            
-            Rectangle().fill(dividerColor).frame(height: 1)
-            
-            if currentView == .history {
+            if library.currentView == .history {
+                Rectangle().fill(dividerColor).frame(height: 1)
                 historyView
-            } else if currentView == .favoritePodcasts {
+            } else if library.currentView == .favoritePodcasts {
+                Rectangle().fill(dividerColor).frame(height: 1)
                 favoritePodcastsView
-            } else if case .category(let cat) = currentView {
+            } else if case .category(let cat) = library.currentView {
+                Rectangle().fill(dividerColor).frame(height: 1)
                 categoryPodcastsView(category: cat)
             } else if shouldShowEpisodeList {
-                if filteredAndSortedEpisodes.isEmpty {
-                    VStack { Spacer(); Text("No episodes").font(.system(size: 14 * scale)).foregroundColor(secondaryText); Spacer() }
-                        .frame(maxWidth: .infinity, maxHeight: .infinity)
-                } else {
-                    ScrollView {
-                        LazyVStack(spacing: 0) {
-                            ForEach(Array(filteredAndSortedEpisodes.enumerated()), id: \.element.id) { index, episode in
-                                VStack(spacing: 0) {
-                                    episodeRow(episode: episode)
-                                    if index < filteredAndSortedEpisodes.count - 1 {
-                                        Rectangle().fill(dividerColor).frame(height: 1).padding(.leading, 12)
-                                    }
-                                }
-                            }
-                        }
+                EpisodeListContentView(
+                    searchText: Binding(
+                        get: { library.searchText },
+                        set: { library.searchText = $0 }
+                    ),
+                    episodeFilter: library.episodeFilter,
+                    episodeSort: library.episodeSort,
+                    filteredEpisodes: filteredAndSortedEpisodes,
+                    scale: scale,
+                    accentColor: theme.accentColor,
+                    dividerColor: dividerColor,
+                    textColor: textColor,
+                    secondaryText: secondaryText,
+                    onSelectFilter: { library.episodeFilter = $0 },
+                    onSelectSort: { library.episodeSort = $0 },
+                    rowContent: { episode, _ in
+                        AnyView(episodeRow(episode: episode))
                     }
-                }
+                )
             } else {
+                Rectangle().fill(dividerColor).frame(height: 1)
                 VStack { Spacer(); Text("Select a podcast").font(.system(size: 14 * scale)).foregroundColor(secondaryText); Spacer() }
                     .frame(maxWidth: .infinity, maxHeight: .infinity)
             }
@@ -953,8 +839,8 @@ struct ContentView: View {
                 ForEach(Array(favoritePodcasts.enumerated()), id: \.element.id) { index, podcast in
                     VStack(spacing: 0) {
                         Button {
-                            currentView = .none; selectedPodcastId = podcast.id
-                            Task { await loadEpisodes(for: podcast) }
+                            library.currentView = .none; library.selectedPodcastId = podcast.id
+                            Task { await library.selectPodcast(podcast) }
                         } label: {
                             HStack {
                                 if let artworkURL = podcast.artworkURL, let url = URL(string: artworkURL) {
@@ -981,7 +867,7 @@ struct ContentView: View {
     }
     
     func categoryPodcastsView(category: String) -> some View {
-        let categoryPodcasts = podcasts.filter { settings.getCategory(for: $0.id) == category }
+        let categoryPodcasts = library.podcasts.filter { settings.getCategory(for: $0.id) == category }
         if categoryPodcasts.isEmpty {
             return AnyView(VStack { Spacer(); Text("No podcasts in this category").font(.system(size: 14 * scale)).foregroundColor(secondaryText); Spacer() }
                 .frame(maxWidth: .infinity, maxHeight: .infinity))
@@ -991,8 +877,7 @@ struct ContentView: View {
                 ForEach(Array(categoryPodcasts.enumerated()), id: \.element.id) { index, podcast in
                     VStack(spacing: 0) {
                         Button {
-                            currentView = .none; selectedPodcastId = podcast.id
-                            Task { await loadEpisodes(for: podcast) }
+                            Task { await library.selectPodcast(podcast) }
                         } label: {
                             HStack {
                                 if let artworkURL = podcast.artworkURL, let url = URL(string: artworkURL) {
@@ -1018,353 +903,143 @@ struct ContentView: View {
     }
     
     func episodeRow(episode: Episode) -> some View {
-        Button { selectedEpisodeId = episode.id } label: {
-            HStack(spacing: 10) {
-                if settings.isPlayed(episode.id) {
-                    Image(systemName: "checkmark.circle.fill").foregroundColor(secondaryText).font(.system(size: 12 * scale))
-                } else if settings.getPosition(for: episode.id) > 0 {
-                    Image(systemName: "circle.lefthalf.filled").foregroundColor(theme.accentColor).font(.system(size: 12 * scale))
-                }
-                
-                if currentlyPlayingEpisode?.id == episode.id {
-                    Image(systemName: isPlaying ? "speaker.wave.2.fill" : "speaker.fill")
-                        .foregroundColor(theme.accentColor).font(.system(size: 12 * scale))
-                }
-                
-                VStack(alignment: .leading, spacing: 4) {
-                    Text(episode.title)
-                        .font(.system(size: 14 * scale, weight: settings.isPlayed(episode.id) ? .regular : .medium))
-                        .foregroundColor(settings.isPlayed(episode.id) ? secondaryText : textColor)
-                        .lineLimit(2).multilineTextAlignment(.leading)
-                    HStack(spacing: 6) {
-                        if let date = episode.pubDate {
-                            Text(date, style: .date).font(.system(size: 11 * scale)).foregroundColor(secondaryText)
-                        }
-                        if let dur = episode.duration, dur > 0 {
-                            Text("•").foregroundColor(secondaryText).font(.system(size: 11 * scale))
-                            Text(formatDuration(dur)).font(.system(size: 11 * scale)).foregroundColor(secondaryText)
-                        }
-                        if favoriteEpisodeIds.contains(episode.id) {
-                            Image(systemName: "heart.fill").foregroundColor(.pink).font(.system(size: 10 * scale))
-                        }
-                        if downloadedEpisodes.contains(episode.id) && currentView != .downloads {
-                            Image(systemName: "arrow.down.circle.fill").foregroundColor(.green).font(.system(size: 10 * scale))
-                        }
-                        if playQueue.contains(where: { $0.id == episode.id }) {
-                            Image(systemName: "list.number").foregroundColor(theme.accentColor).font(.system(size: 10 * scale))
-                        }
-                        if !settings.getNote(for: episode.id).isEmpty {
-                            Image(systemName: "note.text").foregroundColor(.orange).font(.system(size: 10 * scale))
-                        }
-                    }
-                }
-                Spacer()
-            }
-            .padding(.horizontal, 12).padding(.vertical, 10)
-            .frame(maxWidth: .infinity, alignment: .leading)
-            .background(selectedEpisodeId == episode.id ? theme.accentColor.opacity(0.3) : Color.clear)
-        }
-        .buttonStyle(.plain)
-        .contextMenu {
-            Button { addToQueue(episode) } label: { Label("Add to Queue", systemImage: "text.badge.plus") }
-            Button { playNext(episode) } label: { Label("Play Next", systemImage: "text.insert") }
-            Divider()
-            if settings.isPlayed(episode.id) {
-                Button { settings.markAsUnplayed(episode.id) } label: { Label("Mark as Unplayed", systemImage: "circle") }
-            } else {
-                Button { settings.markAsPlayed(episode.id) } label: { Label("Mark as Played", systemImage: "checkmark.circle") }
-            }
-            Divider()
-            Button { toggleFavoriteEpisode(episode) } label: {
-                Label(favoriteEpisodeIds.contains(episode.id) ? "Remove from Favorites" : "Add to Favorites",
-                      systemImage: favoriteEpisodeIds.contains(episode.id) ? "heart.slash" : "heart")
-            }
-            Button { selectedEpisodeId = episode.id; currentNote = settings.getNote(for: episode.id); showNoteEditor = true } label: {
-                Label("Edit Note...", systemImage: "note.text")
-            }
-            if currentView == .downloads {
-                Button { showInFinder(episode) } label: { Label("Show in Finder", systemImage: "folder") }
-            }
-        }
+        EpisodeRowView(
+            episode: episode,
+            isSelected: library.selectedEpisodeId == episode.id,
+            isPlayed: effectiveIsPlayed(episode),
+            resumePosition: effectiveResumePosition(episode),
+            isCurrentlyPlaying: currentlyPlayingEpisode?.id == episode.id,
+            isPlaying: isPlaying,
+            isFavorite: library.favoriteEpisodeIds.contains(episode.id),
+            isDownloaded: library.downloadedEpisodeIds.contains(episode.id),
+            showDownloadedBadge: library.currentView != .downloads,
+            isQueued: playQueue.contains(where: { $0.id == episode.id }),
+            hasNote: !settings.getNote(for: episode.id).isEmpty,
+            scale: scale,
+            accentColor: theme.accentColor,
+            textColor: textColor,
+            secondaryText: secondaryText,
+            selectionColor: theme.accentColor.opacity(0.3),
+            formatDuration: formatDuration,
+            onSelect: { library.selectedEpisodeId = episode.id },
+            onAddToQueue: { addToQueue(episode) },
+            onPlayNext: { playNext(episode) },
+            onMarkPlayed: { markEpisodePlayed(episode) },
+            onMarkUnplayed: { markEpisodeUnplayed(episode) },
+            onToggleFavorite: { toggleFavoriteEpisode(episode) },
+            onEditNote: {
+                library.selectedEpisodeId = episode.id
+                currentNote = settings.getNote(for: episode.id)
+                showNoteEditor = true
+            },
+            onShowInFinder: library.currentView == .downloads ? { showInFinder(episode) } : nil
+        )
     }
     
     // MARK: - Detail View
     var detailView: some View {
-        VStack {
-            if let episode = selectedEpisode {
-                ScrollView {
-                    VStack(alignment: .leading, spacing: 14) {
-                        if let podcast = podcasts.first(where: { $0.id == episode.podcastId }),
-                           let artworkURL = podcast.artworkURL, let url = URL(string: artworkURL) {
-                            HStack {
-                                AsyncImage(url: url) { image in
-                                    image.resizable().aspectRatio(contentMode: .fill)
-                                } placeholder: {
-                                    Rectangle().fill(dividerColor)
-                                }
-                                .frame(width: 100, height: 100)
-                                .cornerRadius(8)
-                                Spacer()
-                            }
-                        }
-                        
-                        Text(episode.title)
-                            .font(.system(size: 22 * scale, weight: .bold))
-                            .foregroundColor(textColor)
-                            .textSelection(.enabled)
-                        
-                        HStack(spacing: 12) {
-                            if let date = episode.pubDate {
-                                Text(date, style: .date).font(.system(size: 13 * scale)).foregroundColor(secondaryText)
-                            }
-                            if let dur = episode.duration, dur > 0 {
-                                Text("•").foregroundColor(secondaryText)
-                                Text(formatDuration(dur)).font(.system(size: 13 * scale)).foregroundColor(secondaryText)
-                            }
-                            if settings.isPlayed(episode.id) {
-                                Text("•").foregroundColor(secondaryText)
-                                Text("Played").font(.system(size: 13 * scale)).foregroundColor(secondaryText)
-                            } else if settings.getPosition(for: episode.id) > 0 {
-                                Text("•").foregroundColor(secondaryText)
-                                Text("\(formatTime(settings.getPosition(for: episode.id))) in").font(.system(size: 13 * scale)).foregroundColor(theme.accentColor)
-                            }
-                        }
-                        
-                        HStack(spacing: 8) {
-                            Button {
-                                if currentlyPlayingEpisode?.id == episode.id { togglePlayPause() }
-                                else {
-                                    let podcastTitle = podcasts.first { $0.id == episode.podcastId }?.title ?? ""
-                                    playEpisode(episode, podcastTitle: podcastTitle)
-                                }
-                            } label: {
-                                Label(currentlyPlayingEpisode?.id == episode.id && isPlaying ? "Pause" : (settings.getPosition(for: episode.id) > 0 ? "Resume" : "Play"),
-                                      systemImage: currentlyPlayingEpisode?.id == episode.id && isPlaying ? "pause.fill" : "play.fill")
-                                    .font(.system(size: 13 * scale, weight: .medium))
-                                    .foregroundColor(theme.buttonText)
-                                    .padding(.horizontal, 12).padding(.vertical, 6)
-                                    .background(theme.buttonBg)
-                                    .cornerRadius(6)
-                            }.buttonStyle(.plain)
-                            
-                            Button { addToQueue(episode) } label: {
-                                Label("Queue", systemImage: "text.badge.plus")
-                                    .font(.system(size: 13 * scale, weight: .medium))
-                                    .foregroundColor(playQueue.contains { $0.id == episode.id } ? .white : textColor)
-                                    .padding(.horizontal, 12).padding(.vertical, 6)
-                                    .background(playQueue.contains { $0.id == episode.id } ? theme.accentColor : dividerColor.opacity(0.5))
-                                    .cornerRadius(6)
-                            }.buttonStyle(.plain)
-                            
-                            Button { toggleFavoriteEpisode(episode) } label: {
-                                Image(systemName: favoriteEpisodeIds.contains(episode.id) ? "heart.fill" : "heart")
-                                    .font(.system(size: 14 * scale))
-                                    .foregroundColor(favoriteEpisodeIds.contains(episode.id) ? .pink : textColor)
-                                    .padding(6)
-                                    .background(dividerColor.opacity(0.5))
-                                    .cornerRadius(6)
-                            }.buttonStyle(.plain)
-                            
-                            if downloadedEpisodes.contains(episode.id) {
-                                Menu {
-                                    Button { showInFinder(episode) } label: { Label("Show in Finder", systemImage: "folder") }
-                                    Button(role: .destructive) { deleteDownload(episode) } label: { Label("Delete", systemImage: "trash") }
-                                } label: {
-                                    Image(systemName: "checkmark.circle.fill")
-                                        .font(.system(size: 14 * scale))
-                                        .foregroundColor(.green)
-                                        .padding(6)
-                                        .background(dividerColor.opacity(0.5))
-                                        .cornerRadius(6)
-                                }
-                            } else if downloadingEpisodes.contains(episode.id) {
-                                ProgressView().scaleEffect(0.7)
-                            } else {
-                                Button { Task { await downloadEpisode(episode) } } label: {
-                                    Image(systemName: "arrow.down.circle")
-                                        .font(.system(size: 14 * scale))
-                                        .foregroundColor(textColor)
-                                        .padding(6)
-                                        .background(dividerColor.opacity(0.5))
-                                        .cornerRadius(6)
-                                }.buttonStyle(.plain)
-                            }
-                        }
-                        
-                        let note = settings.getNote(for: episode.id)
-                        if !note.isEmpty {
-                            VStack(alignment: .leading, spacing: 6) {
-                                HStack {
-                                    Image(systemName: "note.text").foregroundColor(.orange).font(.system(size: 12))
-                                    Text("Note").font(.system(size: 13 * scale, weight: .medium)).foregroundColor(textColor)
-                                    Spacer()
-                                    Button { currentNote = note; showNoteEditor = true } label: {
-                                        Text("Edit").font(.system(size: 11 * scale)).foregroundColor(theme.accentColor)
-                                    }.buttonStyle(.plain)
-                                }
-                                Text(note)
-                                    .font(.system(size: 13 * scale))
-                                    .foregroundColor(secondaryText)
-                                    .padding(10)
-                                    .frame(maxWidth: .infinity, alignment: .leading)
-                                    .background(dividerColor.opacity(0.3))
-                                    .cornerRadius(6)
-                            }
-                        } else {
-                            Button { currentNote = ""; showNoteEditor = true } label: {
-                                Label("Add Note", systemImage: "note.text.badge.plus")
-                                    .font(.system(size: 12 * scale))
-                                    .foregroundColor(secondaryText)
-                            }.buttonStyle(.plain)
-                        }
-                        
-                        Rectangle().fill(dividerColor).frame(height: 1).padding(.vertical, 4)
-                        
-                        if let description = episode.episodeDescription {
-                            Text("Description").font(.system(size: 14 * scale, weight: .semibold)).foregroundColor(textColor)
-                            Text(stripHTML(description))
-                                .font(.system(size: 13 * scale))
-                                .foregroundColor(textColor)
-                                .textSelection(.enabled)
-                                .lineSpacing(4)
-                        }
-                    }
-                    .padding(18)
-                    .frame(maxWidth: .infinity, alignment: .leading)
+        EpisodeDetailPaneView(
+            episode: selectedEpisode,
+            podcast: selectedEpisode.flatMap { episode in library.podcasts.first(where: { $0.id == episode.podcastId }) },
+            currentlyPlayingEpisodeID: currentlyPlayingEpisode?.id,
+            isPlaying: isPlaying,
+            isEpisodePlayed: selectedEpisode.map(effectiveIsPlayed) ?? false,
+            resumePosition: selectedEpisode.map(effectiveResumePosition) ?? 0,
+            isFavorite: selectedEpisode.map { library.favoriteEpisodeIds.contains($0.id) } ?? false,
+            isQueued: selectedEpisode.map { episode in playQueue.contains { $0.id == episode.id } } ?? false,
+            isDownloaded: selectedEpisode.map { library.downloadedEpisodeIds.contains($0.id) } ?? false,
+            isDownloading: selectedEpisode.map { downloadManager.isDownloading(episodeId: $0.id) } ?? false,
+            note: selectedEpisode.map { settings.getNote(for: $0.id) } ?? "",
+            scale: scale,
+            accentColor: theme.accentColor,
+            buttonBg: theme.buttonBg,
+            buttonText: theme.buttonText,
+            detailBg: detailBg,
+            dividerColor: dividerColor,
+            textColor: textColor,
+            secondaryText: secondaryText,
+            onPlayPause: togglePlayPause,
+            onPlayEpisode: { episode in
+                Task {
+                    await playEpisode(episode)
                 }
-            } else {
-                VStack(spacing: 12) {
-                    Spacer()
-                    Image(systemName: "radio").font(.system(size: 50)).foregroundColor(theme.accentColor.opacity(0.6))
-                    Text("Welcome to PodVault").font(.system(size: 24 * scale, weight: .bold)).foregroundColor(textColor)
-                    Text("Select a podcast and episode").font(.system(size: 14 * scale)).foregroundColor(secondaryText)
-                    Spacer()
+            },
+            onQueue: addToQueue,
+            onToggleFavorite: toggleFavoriteEpisode,
+            onShowInFinder: showInFinder,
+            onDeleteDownload: deleteDownload,
+            onDownload: { episode in
+                Task {
+                    await downloadEpisode(episode)
                 }
-                .frame(maxWidth: .infinity, maxHeight: .infinity)
-            }
-        }
-        .background(detailBg)
+            },
+            onEditNote: {
+                if let episode = selectedEpisode {
+                    currentNote = settings.getNote(for: episode.id)
+                    showNoteEditor = true
+                }
+            },
+            onAddNote: {
+                currentNote = ""
+                showNoteEditor = true
+            },
+            formatDuration: formatDuration,
+            formatTime: formatTime,
+            stripHTML: stripHTML
+        )
     }
     
     // MARK: - Queue View
     var queueView: some View {
-        VStack(alignment: .leading, spacing: 0) {
-            HStack {
-                Image(systemName: "list.number").foregroundColor(theme.accentColor).font(.system(size: 14 * scale))
-                Text("Up Next").font(.system(size: 14 * scale, weight: .semibold)).foregroundColor(textColor)
-                Spacer()
-                if !playQueue.isEmpty {
-                    Button { playQueue.removeAll() } label: {
-                        Text("Clear").font(.system(size: 12 * scale)).foregroundColor(theme.accentColor)
-                    }.buttonStyle(.plain)
-                }
-            }
-            .padding(.horizontal, 16).padding(.vertical, 10)
-            
-            Rectangle().fill(dividerColor).frame(height: 1)
-            
-            if playQueue.isEmpty {
-                VStack {
-                    Spacer()
-                    Text("Queue is empty").font(.system(size: 13 * scale)).foregroundColor(secondaryText)
-                    Spacer()
-                }
-                .frame(maxWidth: .infinity, maxHeight: .infinity)
-            } else {
-                ScrollView {
-                    LazyVStack(spacing: 0) {
-                        ForEach(Array(playQueue.enumerated()), id: \.element.id) { index, episode in
-                            VStack(spacing: 0) {
-                                HStack(spacing: 10) {
-                                    Text("\(index + 1)").font(.system(size: 12 * scale, weight: .medium)).foregroundColor(secondaryText).frame(width: 20)
-                                    VStack(alignment: .leading, spacing: 2) {
-                                        Text(episode.title).font(.system(size: 13 * scale, weight: .medium)).foregroundColor(textColor).lineLimit(1)
-                                        if let dur = episode.duration, dur > 0 {
-                                            Text(formatDuration(dur)).font(.system(size: 11 * scale)).foregroundColor(secondaryText)
-                                        }
-                                    }
-                                    Spacer()
-                                    Button { playQueue.remove(at: index) } label: {
-                                        Image(systemName: "xmark.circle.fill").font(.system(size: 14)).foregroundColor(secondaryText)
-                                    }.buttonStyle(.plain)
-                                }
-                                .padding(.horizontal, 16).padding(.vertical, 8)
-                                .contentShape(Rectangle())
-                                .onTapGesture { playFromQueue(at: index) }
-                                
-                                if index < playQueue.count - 1 {
-                                    Rectangle().fill(dividerColor).frame(height: 1).padding(.leading, 46)
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-        }
-        .frame(height: 180)
-        .background(queueBg)
+        QueuePanelView(
+            queue: playQueue,
+            activeDownloads: downloadManager.activeDownloads.values.sorted { $0.startTime < $1.startTime },
+            queuedDownloads: downloadManager.queuedDownloads,
+            overallDownloadProgress: downloadManager.overallProgress,
+            accentColor: theme.accentColor,
+            textColor: textColor,
+            secondaryText: secondaryText,
+            dividerColor: dividerColor,
+            backgroundColor: queueBg,
+            scale: scale,
+            formatDuration: formatDuration,
+            onClear: { playQueue.removeAll() },
+            onRemove: { playQueue.remove(at: $0) },
+            onSelect: playFromQueue(at:),
+            onCancelDownload: { downloadManager.cancelDownload(episodeId: $0) },
+            onCancelAllDownloads: { downloadManager.cancelAllDownloads() }
+        )
     }
     
     // MARK: - Now Playing Bar
     func nowPlayingBar(episode: Episode) -> some View {
-        VStack(spacing: 0) {
-            Rectangle().fill(theme.accentColor).frame(height: 2)
-            HStack(spacing: 14) {
-                Button { skipBackward() } label: { Image(systemName: "gobackward.15").font(.system(size: 18 * scale)) }
-                    .buttonStyle(.plain).foregroundColor(theme.accentColor)
-                
-                Button { togglePlayPause() } label: { Image(systemName: isPlaying ? "pause.fill" : "play.fill").font(.system(size: 22 * scale)) }
-                    .buttonStyle(.plain).foregroundColor(theme.accentColor)
-                
-                Button { skipForward() } label: { Image(systemName: "goforward.30").font(.system(size: 18 * scale)) }
-                    .buttonStyle(.plain).foregroundColor(theme.accentColor)
-                
-                Button { playNextEpisode() } label: { Image(systemName: "forward.end.fill").font(.system(size: 16 * scale)) }
-                    .buttonStyle(.plain).foregroundColor(hasNextEpisode ? theme.accentColor : secondaryText.opacity(0.5))
-                    .disabled(!hasNextEpisode)
-                
-                VStack(alignment: .leading, spacing: 2) {
-                    Text(episode.title).font(.system(size: 14 * scale, weight: .semibold)).foregroundColor(textColor).lineLimit(1)
-                    Text("\(formatTime(currentTime)) / \(formatTime(duration))").font(.system(size: 11 * scale)).foregroundColor(secondaryText)
-                }
-                
-                Spacer()
-                
-                if settings.volumeBoost != 1.0 {
-                    Text("\(Int(settings.volumeBoost * 100))%")
-                        .font(.system(size: 10 * scale))
-                        .foregroundColor(secondaryText)
-                        .padding(.horizontal, 6).padding(.vertical, 2)
-                        .background(dividerColor.opacity(0.5))
-                        .cornerRadius(4)
-                }
-                
-                Slider(value: $currentTime, in: 0...max(duration, 1)) { editing in if !editing { seek(to: currentTime) } }
-                    .frame(width: 160).tint(theme.accentColor)
-                
-                Menu {
-                    ForEach(playbackSpeeds, id: \.self) { speed in
-                        Button { setPlaybackSpeed(speed) } label: {
-                            if settings.playbackSpeed == speed { Text("✓ \(formatSpeed(speed))") }
-                            else { Text("    \(formatSpeed(speed))") }
-                        }
-                    }
-                } label: {
-                    Text(formatSpeed(settings.playbackSpeed))
-                        .font(.system(size: 12 * scale, weight: .medium))
-                        .foregroundColor(theme.buttonText)
-                        .padding(.horizontal, 10).padding(.vertical, 6)
-                        .background(theme.buttonBg)
-                        .cornerRadius(6)
-                }
-                .menuStyle(.borderlessButton).frame(width: 60)
-                
-                Button { stopPlayback() } label: { Image(systemName: "xmark.circle.fill").font(.system(size: 20 * scale)) }
-                    .buttonStyle(.plain).foregroundColor(secondaryText)
-            }
-            .padding(.horizontal, 20).padding(.vertical, 12)
-            .background(sidebarBg)
-        }
+        NowPlayingBarView(
+            episode: episode,
+            isPlaying: isPlaying,
+            currentTime: currentTime,
+            duration: duration,
+            hasNextEpisode: hasNextEpisode,
+            scale: scale,
+            accentColor: theme.accentColor,
+            buttonBg: theme.buttonBg,
+            buttonText: theme.buttonText,
+            sidebarBg: sidebarBg,
+            dividerColor: dividerColor,
+            textColor: textColor,
+            secondaryText: secondaryText,
+            volumeBoost: settings.volumeBoost,
+            selectedSpeed: settings.playbackSpeed,
+            playbackSpeeds: playbackSpeeds,
+            formatTime: formatTime,
+            formatSpeed: formatSpeed,
+            onSkipBackward: skipBackward,
+            onPlayPause: togglePlayPause,
+            onSkipForward: skipForward,
+            onNext: playNextEpisode,
+            onSeek: { playbackManager.seek(to: $0) },
+            onSetSpeed: setPlaybackSpeed,
+            onStop: stopPlayback
+        )
     }
     
     // MARK: - Sheets
@@ -1546,83 +1221,28 @@ struct ContentView: View {
         guard index < playQueue.count else { return }
         let episode = playQueue[index]
         playQueue.remove(at: index)
-        let podcastTitle = podcasts.first { $0.id == episode.podcastId }?.title ?? ""
-        playEpisode(episode, podcastTitle: podcastTitle)
+        
+        Task {
+            await playEpisode(episode)
+        }
     }
     
     func playNextInQueue() {
         guard !playQueue.isEmpty else { return }
         let episode = playQueue.removeFirst()
-        let podcastTitle = podcasts.first { $0.id == episode.podcastId }?.title ?? ""
-        playEpisode(episode, podcastTitle: podcastTitle)
+        
+        Task {
+            await playEpisode(episode)
+        }
     }
     
     // MARK: - Playback
     
-    func playEpisode(_ episode: Episode, podcastTitle: String) {
-        let localFile = localFileURL(for: episode)
-        let playURL: URL? = FileManager.default.fileExists(atPath: localFile.path) ? localFile :
-            episode.audioURL.flatMap { URL(string: $0) }
-        guard let url = playURL else { return }
-        
-        if let current = currentlyPlayingEpisode, currentTime > 10 {
-            settings.savePosition(for: current.id, position: currentTime)
-            let listened = currentTime - settings.getPosition(for: current.id)
-            if listened > 60 { settings.addListeningTime(listened) }
-        }
-        
-        if let observer = playbackEndObserver {
-            NotificationCenter.default.removeObserver(observer)
-        }
-        
-        stopPlaybackWithoutSaving()
-        player = AVPlayer(playerItem: AVPlayerItem(url: url))
-        currentlyPlayingEpisode = episode
-        currentPodcastTitle = podcastTitle
-        
-        player?.volume = settings.volumeBoost
-        
-        let savedPosition = settings.getPosition(for: episode.id)
-        if savedPosition > 0 {
-            player?.seek(to: CMTime(seconds: savedPosition, preferredTimescale: 600))
-        }
-        
-        player?.addPeriodicTimeObserver(forInterval: CMTime(seconds: 0.5, preferredTimescale: 600), queue: .main) { time in
-            currentTime = time.seconds
-            if let dur = player?.currentItem?.duration.seconds, dur.isFinite {
-                duration = dur
-                if currentTime > dur - 30 && dur > 60 {
-                    settings.markAsPlayed(episode.id)
-                }
-            }
-            
-            if Date().timeIntervalSince(lastPositionSaveTime) > 30 {
-                settings.savePosition(for: episode.id, position: currentTime)
-                lastPositionSaveTime = Date()
-            }
-        }
-        
-        playbackEndObserver = NotificationCenter.default.addObserver(
-            forName: .AVPlayerItemDidPlayToEndTime,
-            object: player?.currentItem,
-            queue: .main
-        ) { _ in
-            settings.markAsPlayed(episode.id)
-            settings.addToHistory(episode, podcastTitle: podcastTitle)
-            settings.addListeningTime(duration)
-            
-            if !playQueue.isEmpty {
-                playNextInQueue()
-            } else if settings.continuousPlayback {
-                playNextEpisodeInFeed()
-            } else {
-                stopPlayback()
-            }
-        }
-        
-        player?.play()
-        player?.rate = settings.playbackSpeed
-        isPlaying = true
+    func playEpisode(_ episode: Episode) async {
+        guard let podcast = library.podcasts.first(where: { $0.id == episode.podcastId }) else { return }
+        playbackManager.playbackSpeed = settings.playbackSpeed
+        playbackManager.setVolumeBoost(settings.volumeBoost)
+        await playbackManager.play(episode: episode, podcast: podcast)
     }
     
     func playNextEpisode() {
@@ -1635,123 +1255,97 @@ struct ContentView: View {
     
     func playNextEpisodeInFeed() {
         guard let current = currentlyPlayingEpisode else { return }
-        let feedEpisodes = episodes.sorted { ($0.pubDate ?? .distantPast) > ($1.pubDate ?? .distantPast) }
+        let feedEpisodes = library.episodes.sorted { ($0.pubDate ?? .distantPast) > ($1.pubDate ?? .distantPast) }
         if let index = feedEpisodes.firstIndex(where: { $0.id == current.id }), index + 1 < feedEpisodes.count {
             let next = feedEpisodes[index + 1]
-            let podcastTitle = podcasts.first { $0.id == next.podcastId }?.title ?? ""
-            playEpisode(next, podcastTitle: podcastTitle)
+            Task {
+                await playEpisode(next)
+            }
         } else {
             stopPlayback()
         }
     }
     
     func togglePlayPause() {
-        guard let player = player else { return }
-        if isPlaying {
-            player.pause()
-            if let episode = currentlyPlayingEpisode {
-                settings.savePosition(for: episode.id, position: currentTime)
-            }
-        } else {
-            player.play()
-            player.rate = settings.playbackSpeed
-        }
-        isPlaying.toggle()
-    }
-    
-    func stopPlaybackWithoutSaving() {
-        player?.pause()
-        player = nil
-        isPlaying = false
-        currentlyPlayingEpisode = nil
-        currentTime = 0
-        duration = 0
+        playbackManager.togglePlayPause()
     }
     
     func stopPlayback() {
-        if let episode = currentlyPlayingEpisode, currentTime > 10 {
-            settings.savePosition(for: episode.id, position: currentTime)
-        }
-        stopPlaybackWithoutSaving()
+        playbackManager.stop()
     }
     
-    func seek(to time: Double) { player?.seek(to: CMTime(seconds: time, preferredTimescale: 600)) }
-    func skipForward() { let t = min(currentTime + 30, duration); seek(to: t); currentTime = t }
-    func skipBackward() { let t = max(currentTime - 15, 0); seek(to: t); currentTime = t }
+    func seek(to time: Double) { playbackManager.seek(to: time) }
+    func skipForward() { playbackManager.skipForward() }
+    func skipBackward() { playbackManager.skipBackward() }
     
     func setPlaybackSpeed(_ speed: Float) {
         settings.playbackSpeed = speed
         settings.save()
-        if isPlaying { player?.rate = speed }
+        playbackManager.playbackSpeed = speed
     }
     
     func adjustVolume(by delta: Float) {
         settings.volumeBoost = max(0.5, min(2.0, settings.volumeBoost + delta))
-        player?.volume = settings.volumeBoost
+        playbackManager.setVolumeBoost(settings.volumeBoost)
         settings.save()
+    }
+    
+    func handlePlaybackEnded(_ notification: Notification) {
+        if let episode = notification.userInfo?["episode"] as? Episode,
+           let podcastTitle = notification.userInfo?["podcastTitle"] as? String {
+            settings.addToHistory(episode, podcastTitle: podcastTitle)
+        }
+        
+        if let playbackDuration = notification.userInfo?["playbackDuration"] as? Double,
+           playbackDuration > 0 {
+            settings.addListeningTime(playbackDuration)
+        }
+        
+        if !playQueue.isEmpty {
+            playNextInQueue()
+        } else if settings.continuousPlayback {
+            playNextEpisodeInFeed()
+        }
+
+        Task {
+            _ = await library.loadInProgressEpisodesList()
+        }
+    }
+
+    func handleDownloadCompleted(_ notification: Notification) {
+        Task {
+            await loadDownloadedEpisodesList()
+        }
     }
     
     // MARK: - Data Operations
     
     func loadPodcasts() async {
-        do {
-            let loaded = try await PodcastRepository().getAllPodcasts()
-            await MainActor.run { podcasts = loaded }
-        } catch { print("Error: \(error)") }
+        await library.loadPodcasts()
     }
     
     func loadEpisodes(for podcast: Podcast) async {
-        do {
-            let loaded = try await PodcastRepository().getEpisodes(forPodcast: podcast.id)
-            await MainActor.run { episodes = loaded }
-        } catch { print("Error: \(error)") }
+        await library.loadEpisodes(for: podcast)
     }
     
     func loadAllEpisodes() async {
-        do {
-            let repo = PodcastRepository()
-            var all: [Episode] = []
-            for podcast in podcasts {
-                let eps = try await repo.getEpisodes(forPodcast: podcast.id)
-                all.append(contentsOf: eps)
-            }
-            all.sort { ($0.pubDate ?? .distantPast) > ($1.pubDate ?? .distantPast) }
-            await MainActor.run { allEpisodes = all }
-        } catch { print("Error: \(error)") }
+        await library.loadAllEpisodes()
     }
     
     func loadDownloadedEpisodesList() async {
-        do {
-            let repo = PodcastRepository()
-            var downloaded: [Episode] = []
-            for id in downloadedEpisodes {
-                if let ep = try await repo.getEpisode(id: id) { downloaded.append(ep) }
-            }
-            downloaded.sort { ($0.pubDate ?? .distantPast) > ($1.pubDate ?? .distantPast) }
-            await MainActor.run { downloadedEpisodesList = downloaded }
-        } catch { print("Error: \(error)") }
+        _ = await library.loadDownloadedEpisodesList()
     }
     
     func loadFavoriteEpisodesList() async {
-        do {
-            let repo = PodcastRepository()
-            var favorites: [Episode] = []
-            for id in favoriteEpisodeIds {
-                if let ep = try await repo.getEpisode(id: id) { favorites.append(ep) }
-            }
-            favorites.sort { ($0.pubDate ?? .distantPast) > ($1.pubDate ?? .distantPast) }
-            await MainActor.run { favoriteEpisodesList = favorites }
-        } catch { print("Error: \(error)") }
+        _ = await library.loadFavoriteEpisodesList()
     }
     
     func addPodcast(url: String) async {
         await MainActor.run { isLoading = true; errorMessage = nil }
         do {
-            let result = try await FeedService().fetchFeed(url: url)
-            let repo = PodcastRepository()
-            try await repo.savePodcast(result.podcast)
-            try await repo.saveEpisodes(result.episodes)
+            let podcast = try await libraryService.addPodcast(feedURL: url)
             await loadPodcasts()
+            await library.selectPodcast(podcast)
             await MainActor.run { isLoading = false; showAddSheet = false; feedURL = "" }
         } catch {
             await MainActor.run { isLoading = false; errorMessage = "Failed: \(error.localizedDescription)" }
@@ -1760,30 +1354,63 @@ struct ContentView: View {
     
     func deletePodcast(_ podcast: Podcast) async {
         do {
-            try await PodcastRepository().deletePodcast(id: podcast.id)
+            try await libraryService.deletePodcast(id: podcast.id)
             await loadPodcasts()
-            favoritePodcastIds.remove(podcast.id)
-            saveFavorites()
+            library.handleDeletedPodcast(id: podcast.id)
             settings.podcastCategories.removeValue(forKey: podcast.id)
             settings.save()
-            if selectedPodcastId == podcast.id { selectedPodcastId = nil }
         } catch { print("Error: \(error)") }
     }
     
-    func refreshFeed(_ podcast: Podcast) async {
+    func refreshFeed(_ podcast: Podcast, reloadLibraryState: Bool = true) async -> PodcastRefreshResult? {
         do {
-            let result = try await FeedService().fetchFeed(url: podcast.feedURL)
-            let repo = PodcastRepository()
-            try await repo.saveEpisodes(result.episodes)
-            if selectedPodcastId == podcast.id { await loadEpisodes(for: podcast) }
-            if currentView == .allEpisodes { await loadAllEpisodes() }
-        } catch { print("Error: \(error)") }
+            let result = try await libraryService.refreshPodcast(podcast)
+            guard reloadLibraryState else { return result }
+            await loadPodcasts()
+            await library.reloadVisibleContent(afterPodcastUpdate: podcast)
+            await MainActor.run {
+                refreshSummary = .singlePodcastSuccess(title: podcast.title, newEpisodeCount: result.newEpisodeCount)
+            }
+            return result
+        } catch {
+            print("Error: \(error)")
+            if reloadLibraryState {
+                await MainActor.run {
+                    refreshSummary = .singlePodcastFailure(title: podcast.title)
+                }
+            }
+            return nil
+        }
     }
     
     func refreshAllFeeds() async {
-        await MainActor.run { isRefreshing = true }
-        for podcast in podcasts { await refreshFeed(podcast) }
-        await MainActor.run { isRefreshing = false }
+        await MainActor.run {
+            library.isRefreshing = true
+            refreshSummary = nil
+        }
+        let podcastsToRefresh = library.podcasts
+        var successfulRefreshes = 0
+        var newEpisodeCount = 0
+        var failedFeeds: [String] = []
+
+        for podcast in podcastsToRefresh {
+            if let result = await refreshFeed(podcast, reloadLibraryState: false) {
+                successfulRefreshes += 1
+                newEpisodeCount += result.newEpisodeCount
+            } else {
+                failedFeeds.append(podcast.title)
+            }
+        }
+        await loadPodcasts()
+        await library.reloadVisibleContentAfterLibraryRefresh()
+        await MainActor.run {
+            library.isRefreshing = false
+            refreshSummary = .libraryRefresh(
+                refreshedFeedCount: successfulRefreshes,
+                newEpisodeCount: newEpisodeCount,
+                failedFeeds: failedFeeds
+            )
+        }
     }
     
     // MARK: - Favorites
@@ -1795,74 +1422,88 @@ struct ContentView: View {
         return podvault.appendingPathComponent("favorites.json")
     }
     
-    func loadFavorites() {
-        if let data = try? Data(contentsOf: favoritesURL),
-           let fav = try? JSONDecoder().decode(FavoritesData.self, from: data) {
-            favoritePodcastIds = Set(fav.podcastIds)
-            favoriteEpisodeIds = Set(fav.episodeIds)
+    func loadFavorites() async {
+        do {
+            let favorites = try await libraryService.loadFavorites(legacyFavoritesURL: favoritesURL)
+            await MainActor.run {
+                library.applyFavorites(podcastIds: favorites.podcastIDs, episodes: favorites.episodes)
+            }
+        } catch {
+            print("Error: \(error)")
         }
     }
     
-    func saveFavorites() {
-        let data = FavoritesData(podcastIds: Array(favoritePodcastIds), episodeIds: Array(favoriteEpisodeIds))
-        if let encoded = try? JSONEncoder().encode(data) { try? encoded.write(to: favoritesURL) }
-    }
-    
     func toggleFavoritePodcast(_ podcast: Podcast) {
-        if favoritePodcastIds.contains(podcast.id) { favoritePodcastIds.remove(podcast.id) }
-        else { favoritePodcastIds.insert(podcast.id) }
-        saveFavorites()
+        let isFavorite = !library.favoritePodcastIds.contains(podcast.id)
+        
+        Task {
+            do {
+                try await libraryService.setPodcastFavorite(id: podcast.id, isFavorite: isFavorite)
+                await loadFavorites()
+                await loadPodcasts()
+            } catch {
+                print("Error: \(error)")
+            }
+        }
     }
     
     func toggleFavoriteEpisode(_ episode: Episode) {
-        if favoriteEpisodeIds.contains(episode.id) {
-            favoriteEpisodeIds.remove(episode.id)
-            if currentView == .favoriteEpisodes { favoriteEpisodesList.removeAll { $0.id == episode.id } }
-        } else { favoriteEpisodeIds.insert(episode.id) }
-        saveFavorites()
+        let isFavorite = !library.favoriteEpisodeIds.contains(episode.id)
+        
+        Task {
+            do {
+                try await libraryService.setEpisodeFavorite(id: episode.id, isFavorite: isFavorite)
+                await loadFavorites()
+                await library.reloadVisibleContent(afterEpisodeUpdateInPodcastId: episode.podcastId)
+            } catch {
+                print("Error: \(error)")
+            }
+        }
+    }
+
+    func markEpisodePlayed(_ episode: Episode) {
+        Task {
+            await libraryService.markEpisodePlayed(id: episode.id, played: true, playbackPosition: 0)
+            _ = await library.loadInProgressEpisodesList()
+            await library.reloadVisibleContent(afterEpisodeUpdateInPodcastId: episode.podcastId)
+        }
+    }
+
+    func markEpisodeUnplayed(_ episode: Episode) {
+        Task {
+            await libraryService.markEpisodePlayed(
+                id: episode.id,
+                played: false,
+                playbackPosition: episode.playbackPosition
+            )
+            _ = await library.loadInProgressEpisodesList()
+            await library.reloadVisibleContent(afterEpisodeUpdateInPodcastId: episode.podcastId)
+        }
     }
     
     // MARK: - Downloads
     
-    var downloadsDirectory: URL {
-        let appSupport = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask).first!
-        let downloads = appSupport.appendingPathComponent("PodVault/Downloads", isDirectory: true)
-        try? FileManager.default.createDirectory(at: downloads, withIntermediateDirectories: true)
-        return downloads
-    }
-    
-    func localFileURL(for episode: Episode) -> URL {
-        downloadsDirectory.appendingPathComponent("\(episode.id).mp3")
-    }
-    
-    func loadDownloadedEpisodes() {
-        if let files = try? FileManager.default.contentsOfDirectory(at: downloadsDirectory, includingPropertiesForKeys: nil) {
-            downloadedEpisodes = Set(files.map { $0.deletingPathExtension().lastPathComponent })
-        }
-    }
-    
     func downloadEpisode(_ episode: Episode) async {
-        guard let urlString = episode.audioURL, let url = URL(string: urlString) else { return }
-        await MainActor.run { _ = downloadingEpisodes.insert(episode.id) }
-        do {
-            let (tempURL, _) = try await URLSession.shared.download(from: url)
-            let dest = localFileURL(for: episode)
-            try? FileManager.default.removeItem(at: dest)
-            try FileManager.default.moveItem(at: tempURL, to: dest)
-            await MainActor.run { _ = downloadingEpisodes.remove(episode.id); _ = downloadedEpisodes.insert(episode.id) }
-        } catch {
-            await MainActor.run { _ = downloadingEpisodes.remove(episode.id) }
-        }
+        guard let podcast = library.podcasts.first(where: { $0.id == episode.podcastId }) else { return }
+        await downloadManager.downloadEpisode(episode, podcast: podcast)
     }
     
     func deleteDownload(_ episode: Episode) {
-        try? FileManager.default.removeItem(at: localFileURL(for: episode))
-        downloadedEpisodes.remove(episode.id)
-        if currentView == .downloads { downloadedEpisodesList.removeAll { $0.id == episode.id } }
+        if let path = episode.downloadPath {
+            try? FileManager.default.removeItem(at: URL(fileURLWithPath: path))
+        }
+        library.removeDownloadedEpisode(id: episode.id)
+        
+        Task {
+            await libraryService.clearEpisodeDownload(episode)
+            await loadDownloadedEpisodesList()
+        }
     }
     
     func showInFinder(_ episode: Episode) {
-        NSWorkspace.shared.selectFile(localFileURL(for: episode).path, inFileViewerRootedAtPath: downloadsDirectory.path)
+        guard let path = episode.downloadPath else { return }
+        let fileURL = URL(fileURLWithPath: path)
+        NSWorkspace.shared.selectFile(fileURL.path, inFileViewerRootedAtPath: fileURL.deletingLastPathComponent().path)
     }
     
     // MARK: - OPML & Export
@@ -1900,7 +1541,7 @@ struct ContentView: View {
         panel.nameFieldStringValue = "PodVault.opml"
         if panel.runModal() == .OK, let url = panel.url {
             var opml = "<?xml version=\"1.0\"?>\n<opml version=\"2.0\">\n<head><title>PodVault</title></head>\n<body>\n"
-            for podcast in podcasts {
+            for podcast in library.podcasts {
                 let t = podcast.title.replacingOccurrences(of: "&", with: "&amp;").replacingOccurrences(of: "\"", with: "&quot;")
                 let u = podcast.feedURL.replacingOccurrences(of: "&", with: "&amp;")
                 opml += "<outline text=\"\(t)\" type=\"rss\" xmlUrl=\"\(u)\"/>\n"
@@ -1953,73 +1594,6 @@ struct ContentView: View {
     
     func formatSpeed(_ speed: Float) -> String {
         speed == Float(Int(speed)) ? String(format: "%.0fx", speed) : String(format: "%.2fx", speed)
-    }
-}
-
-// MARK: - Mini Player View
-
-struct MiniPlayerView: View {
-    let episode: Episode?
-    let isPlaying: Bool
-    let currentTime: Double
-    let duration: Double
-    let theme: AppTheme
-    let hasNext: Bool
-    let onPlayPause: () -> Void
-    let onSkipBack: () -> Void
-    let onSkipForward: () -> Void
-    let onNext: () -> Void
-    let onClose: () -> Void
-    @EnvironmentObject var settings: AppSettings
-    
-    var body: some View {
-        VStack(spacing: 8) {
-            if let episode = episode {
-                Text(episode.title)
-                    .font(.system(size: 12, weight: .semibold))
-                    .lineLimit(2)
-                    .multilineTextAlignment(.center)
-                
-                HStack(spacing: 16) {
-                    Button(action: onSkipBack) {
-                        Image(systemName: "gobackward.15").font(.system(size: 14))
-                    }.buttonStyle(.plain)
-                    
-                    Button(action: onPlayPause) {
-                        Image(systemName: isPlaying ? "pause.fill" : "play.fill").font(.system(size: 22))
-                    }.buttonStyle(.plain)
-                    
-                    Button(action: onSkipForward) {
-                        Image(systemName: "goforward.30").font(.system(size: 14))
-                    }.buttonStyle(.plain)
-                    
-                    Button(action: onNext) {
-                        Image(systemName: "forward.end.fill").font(.system(size: 14))
-                    }
-                    .buttonStyle(.plain)
-                    .disabled(!hasNext)
-                    .opacity(hasNext ? 1 : 0.4)
-                }
-                .foregroundColor(theme.accentColor)
-                
-                Text("\(formatTime(currentTime)) / \(formatTime(duration))")
-                    .font(.system(size: 10))
-                    .foregroundColor(.secondary)
-            } else {
-                Text("Nothing playing")
-                    .foregroundColor(.secondary)
-            }
-        }
-        .padding()
-        .frame(width: 300, height: 110)
-        .background(theme.sidebarBgFixed)
-    }
-    
-    func formatTime(_ seconds: Double) -> String {
-        guard seconds.isFinite else { return "0:00" }
-        let m = (Int(seconds) % 3600) / 60
-        let s = Int(seconds) % 60
-        return String(format: "%d:%02d", m, s)
     }
 }
 
