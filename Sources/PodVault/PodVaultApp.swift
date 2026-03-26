@@ -1,5 +1,6 @@
 import SwiftUI
 import AppKit
+import UniformTypeIdentifiers
 
 // MARK: - Theme System
 
@@ -467,6 +468,39 @@ struct RefreshSummary: Equatable {
     }
 }
 
+struct FeedSubscriptionFailure {
+    let url: String
+    let message: String
+}
+
+struct FeedSubscriptionResult {
+    let addedPodcasts: [Podcast]
+    let failures: [FeedSubscriptionFailure]
+}
+
+enum FeedInputParser {
+    static func urls(from input: String) -> [String] {
+        let rawParts = input.components(separatedBy: CharacterSet(charactersIn: "\n,;"))
+        var seen: Set<String> = []
+        var urls: [String] = []
+
+        for part in rawParts {
+            let trimmed = part.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !trimmed.isEmpty, !seen.contains(trimmed) else { continue }
+            seen.insert(trimmed)
+            urls.append(trimmed)
+        }
+
+        return urls
+    }
+}
+
+extension UTType {
+    static var podVaultOPML: UTType {
+        UTType(filenameExtension: "opml") ?? UTType(exportedAs: "com.podvault.opml", conformingTo: .xml)
+    }
+}
+
 // MARK: - Content View
 
 struct ContentView: View {
@@ -478,10 +512,12 @@ struct ContentView: View {
     @StateObject private var downloadManager = DownloadManager.shared
     @StateObject private var library = LibraryViewModel()
     private let libraryService = LibraryService()
+    private let opmlService = OPMLService()
     
     @State private var showAddSheet = false
-    @State private var feedURL = ""
+    @State private var feedInput = ""
     @State private var isLoading = false
+    @State private var isCleaningInactive = false
     @State private var errorMessage: String?
     @State private var sidebarWidth: CGFloat = 220
     @State private var episodesWidth: CGFloat = 320
@@ -493,6 +529,8 @@ struct ContentView: View {
     @State private var currentNote = ""
     @State private var miniPlayerWindow: MiniPlayerWindow?
     @State private var refreshSummary: RefreshSummary?
+    @State private var showCleanupConfirmation = false
+    @State private var operationAlertMessage: String?
     
     let playbackSpeeds: [Float] = [0.5, 0.75, 1.0, 1.25, 1.5, 1.75, 2.0]
     
@@ -584,6 +622,22 @@ struct ContentView: View {
                 .sheet(isPresented: $showCategorySheet) { categorySheet }
                 .sheet(isPresented: $showNoteEditor) { noteEditorSheet }
                 .sheet(isPresented: $showStats) { statsView }
+                .alert("Clean Inactive Feeds", isPresented: $showCleanupConfirmation) {
+                    Button("Cancel", role: .cancel) {}
+                    Button("Remove Inactive Feeds", role: .destructive) {
+                        Task { await cleanupInactiveFeeds() }
+                    }
+                } message: {
+                    Text("This removes podcasts whose newest episode is older than 2 years. Downloaded episodes will be preserved.")
+                }
+                .alert("PodVault", isPresented: Binding(
+                    get: { operationAlertMessage != nil },
+                    set: { if !$0 { operationAlertMessage = nil } }
+                )) {
+                    Button("OK", role: .cancel) {}
+                } message: {
+                    Text(operationAlertMessage ?? "")
+                }
         )
     }
 
@@ -630,6 +684,9 @@ struct ContentView: View {
 
     var contentBody: some View {
         notificationRootLayout
+            .transaction { transaction in
+                transaction.animation = nil
+            }
             .onChange(of: showMiniPlayer) { _, show in
                 if show { openMiniPlayer() } else { closeMiniPlayer() }
             }
@@ -741,6 +798,9 @@ struct ContentView: View {
                 },
                 onShowAddPodcast: {
                     showAddSheet = true
+                },
+                onCleanupInactivePodcasts: {
+                    showCleanupConfirmation = true
                 },
                 onDismissSyncSummary: {
                     refreshSummary = nil
@@ -1046,15 +1106,23 @@ struct ContentView: View {
     
     var addPodcastSheet: some View {
         VStack(spacing: 20) {
-            Text("Add Podcast").font(.system(size: 18 * scale, weight: .semibold))
-            TextField("Feed URL", text: $feedURL).font(.system(size: 14 * scale)).frame(width: 350)
-            if isLoading { ProgressView("Adding podcast...") }
+            Text("Add RSS Feeds").font(.system(size: 18 * scale, weight: .semibold))
+            Text("Paste one feed URL per line. Commas and semicolons also work.")
+                .font(.system(size: 12 * scale))
+                .foregroundColor(secondaryText)
+            TextEditor(text: $feedInput)
+                .font(.system(size: 13 * scale))
+                .frame(width: 380, height: 140)
+                .padding(8)
+                .background(dividerColor.opacity(0.35))
+                .cornerRadius(8)
+            if isLoading { ProgressView("Adding feeds...") }
             if let error = errorMessage { Text(error).foregroundStyle(.red).font(.system(size: 12 * scale)) }
             HStack {
-                Button("Cancel") { showAddSheet = false; feedURL = ""; errorMessage = nil }
-                Button("Add") { Task { await addPodcast(url: feedURL) } }
+                Button("Cancel") { showAddSheet = false; feedInput = ""; errorMessage = nil }
+                Button("Add Feeds") { Task { await addPodcasts(from: feedInput) } }
                     .buttonStyle(.borderedProminent).tint(theme.buttonBg)
-                    .disabled(feedURL.isEmpty || isLoading)
+                    .disabled(FeedInputParser.urls(from: feedInput).isEmpty || isLoading)
             }
         }
         .padding(30)
@@ -1342,14 +1410,82 @@ struct ContentView: View {
     
     func addPodcast(url: String) async {
         await MainActor.run { isLoading = true; errorMessage = nil }
-        do {
-            let podcast = try await libraryService.addPodcast(feedURL: url)
-            await loadPodcasts()
+        let result = await subscribeToFeeds([url])
+        await loadPodcasts()
+
+        if let podcast = result.addedPodcasts.last {
             await library.selectPodcast(podcast)
-            await MainActor.run { isLoading = false; showAddSheet = false; feedURL = "" }
-        } catch {
-            await MainActor.run { isLoading = false; errorMessage = "Failed: \(error.localizedDescription)" }
         }
+
+        await MainActor.run {
+            isLoading = false
+
+            if result.failures.isEmpty {
+                showAddSheet = false
+                feedInput = ""
+                return
+            }
+
+            errorMessage = "Failed: \(result.failures[0].message)"
+        }
+    }
+
+    func addPodcasts(from input: String) async {
+        let urls = FeedInputParser.urls(from: input)
+        guard !urls.isEmpty else {
+            await MainActor.run {
+                errorMessage = "Enter at least one RSS feed URL."
+            }
+            return
+        }
+
+        await MainActor.run {
+            isLoading = true
+            errorMessage = nil
+        }
+
+        let result = await subscribeToFeeds(urls)
+        await loadPodcasts()
+        if let podcast = result.addedPodcasts.last {
+            await library.selectPodcast(podcast)
+        }
+
+        await MainActor.run {
+            isLoading = false
+
+            if result.failures.isEmpty {
+                showAddSheet = false
+                feedInput = ""
+                return
+            }
+
+            feedInput = result.failures.map(\.url).joined(separator: "\n")
+            let addedText = result.addedPodcasts.count == 1 ? "1 feed" : "\(result.addedPodcasts.count) feeds"
+            let failedText = result.failures.count == 1 ? "1 feed" : "\(result.failures.count) feeds"
+            let failureDetails = result.failures.prefix(3).map { "\($0.url): \($0.message)" }.joined(separator: " | ")
+            errorMessage = "Added \(addedText). Failed to add \(failedText). \(failureDetails)"
+        }
+    }
+
+    func subscribeToFeeds(_ urls: [String]) async -> FeedSubscriptionResult {
+        var addedPodcasts: [Podcast] = []
+        var failures: [FeedSubscriptionFailure] = []
+
+        for url in urls {
+            do {
+                let podcast = try await libraryService.addPodcast(feedURL: url)
+                addedPodcasts.append(podcast)
+            } catch {
+                failures.append(
+                    FeedSubscriptionFailure(
+                        url: url,
+                        message: error.localizedDescription
+                    )
+                )
+            }
+        }
+
+        return FeedSubscriptionResult(addedPodcasts: addedPodcasts, failures: failures)
     }
     
     func deletePodcast(_ podcast: Podcast) async {
@@ -1363,6 +1499,27 @@ struct ContentView: View {
     }
     
     func refreshFeed(_ podcast: Podcast, reloadLibraryState: Bool = true) async -> PodcastRefreshResult? {
+        let managesRefreshState = reloadLibraryState
+
+        if reloadLibraryState {
+            let shouldStartRefresh = await MainActor.run { () -> Bool in
+                guard !library.isRefreshing else { return false }
+                library.isRefreshing = true
+                refreshSummary = nil
+                return true
+            }
+
+            guard shouldStartRefresh else { return nil }
+        }
+
+        defer {
+            if managesRefreshState {
+                Task { @MainActor in
+                    library.isRefreshing = false
+                }
+            }
+        }
+
         do {
             let result = try await libraryService.refreshPodcast(podcast)
             guard reloadLibraryState else { return result }
@@ -1382,12 +1539,61 @@ struct ContentView: View {
             return nil
         }
     }
+
+    func cleanupInactiveFeeds() async {
+        let cutoffDate = Calendar.current.date(byAdding: .year, value: -2, to: Date()) ?? Date()
+
+        await MainActor.run {
+            isCleaningInactive = true
+            errorMessage = nil
+        }
+
+        do {
+            let result = try await libraryService.cleanupInactivePodcasts(olderThan: cutoffDate)
+            await loadPodcasts()
+            await loadDownloadedEpisodesList()
+            await loadFavoriteEpisodesList()
+            await library.reloadVisibleContentAfterLibraryRefresh()
+
+            await MainActor.run {
+                for podcast in result.removedPodcasts {
+                    library.handleDeletedPodcast(id: podcast.id)
+                    settings.podcastCategories.removeValue(forKey: podcast.id)
+                }
+                settings.save()
+
+                let removedCount = result.removedPodcasts.count
+                if removedCount == 0 {
+                    operationAlertMessage = "No inactive podcasts were found. Feeds are considered inactive when their newest episode is older than 2 years."
+                } else {
+                    let feedText = removedCount == 1 ? "1 inactive podcast" : "\(removedCount) inactive podcasts"
+                    let downloadText = result.preservedDownloadCount == 1 ? "1 downloaded episode" : "\(result.preservedDownloadCount) downloaded episodes"
+                    operationAlertMessage = "Removed \(feedText) and preserved \(downloadText)."
+                }
+                isCleaningInactive = false
+            }
+        } catch {
+            await MainActor.run {
+                isCleaningInactive = false
+                operationAlertMessage = "Inactive feed cleanup failed: \(error.localizedDescription)"
+            }
+        }
+    }
     
     func refreshAllFeeds() async {
-        await MainActor.run {
+        let shouldStartRefresh = await MainActor.run { () -> Bool in
+            guard !library.isRefreshing else { return false }
             library.isRefreshing = true
             refreshSummary = nil
+            return true
         }
+        guard shouldStartRefresh else { return }
+        defer {
+            Task { @MainActor in
+                library.isRefreshing = false
+            }
+        }
+
         let podcastsToRefresh = library.podcasts
         var successfulRefreshes = 0
         var newEpisodeCount = 0
@@ -1404,7 +1610,6 @@ struct ContentView: View {
         await loadPodcasts()
         await library.reloadVisibleContentAfterLibraryRefresh()
         await MainActor.run {
-            library.isRefreshing = false
             refreshSummary = .libraryRefresh(
                 refreshedFeedCount: successfulRefreshes,
                 newEpisodeCount: newEpisodeCount,
@@ -1510,34 +1715,44 @@ struct ContentView: View {
     
     func importOPML() {
         let panel = NSOpenPanel()
-        panel.allowedContentTypes = [.xml]
+        panel.allowedContentTypes = [.podVaultOPML, .xml]
         panel.allowsMultipleSelection = false
+        panel.canChooseDirectories = false
         if panel.runModal() == .OK, let url = panel.url {
             Task {
-                if let content = try? String(contentsOf: url, encoding: .utf8) {
-                    let urls = parseOPML(content)
-                    for feedURL in urls { await addPodcast(url: feedURL) }
+                do {
+                    let document = try await opmlService.parseOPML(from: url)
+                    guard !document.feeds.isEmpty else {
+                        await MainActor.run {
+                            errorMessage = OPMLError.noFeedsFound.localizedDescription
+                        }
+                        return
+                    }
+
+                    let result = await subscribeToFeeds(document.feeds.map(\.feedURL))
+                    await loadPodcasts()
+                    await MainActor.run {
+                        if result.failures.isEmpty {
+                            operationAlertMessage = "Imported \(result.addedPodcasts.count) feeds from OPML."
+                        } else {
+                            let importedText = result.addedPodcasts.count == 1 ? "1 feed" : "\(result.addedPodcasts.count) feeds"
+                            let failedText = result.failures.count == 1 ? "1 feed" : "\(result.failures.count) feeds"
+                            let failureDetails = result.failures.prefix(3).map { "\($0.url): \($0.message)" }.joined(separator: " | ")
+                            operationAlertMessage = "Imported \(importedText). Failed to import \(failedText). \(failureDetails)"
+                        }
+                    }
+                } catch {
+                    await MainActor.run {
+                        errorMessage = "Failed: \(error.localizedDescription)"
+                    }
                 }
             }
         }
-    }
-    
-    func parseOPML(_ content: String) -> [String] {
-        var urls: [String] = []
-        if let regex = try? NSRegularExpression(pattern: #"xmlUrl="([^"]+)""#, options: []) {
-            let matches = regex.matches(in: content, range: NSRange(content.startIndex..., in: content))
-            for match in matches {
-                if let range = Range(match.range(at: 1), in: content) {
-                    urls.append(String(content[range]))
-                }
-            }
-        }
-        return urls
     }
     
     func exportOPML() {
         let panel = NSSavePanel()
-        panel.allowedContentTypes = [.xml]
+        panel.allowedContentTypes = [.podVaultOPML, .xml]
         panel.nameFieldStringValue = "PodVault.opml"
         if panel.runModal() == .OK, let url = panel.url {
             var opml = "<?xml version=\"1.0\"?>\n<opml version=\"2.0\">\n<head><title>PodVault</title></head>\n<body>\n"

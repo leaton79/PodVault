@@ -7,13 +7,43 @@ struct FeedResult {
 
 class FeedService {
     private let repository = PodcastRepository()
+    private let session: URLSession
+
+    init(session: URLSession? = nil) {
+        if let session {
+            self.session = session
+        } else {
+            let configuration = URLSessionConfiguration.ephemeral
+            configuration.timeoutIntervalForRequest = 30
+            configuration.timeoutIntervalForResource = 60
+            configuration.httpAdditionalHeaders = [
+                "User-Agent": "PodVault/1.0 (macOS) AppleWebKit/605.1.15",
+                "Accept": "application/rss+xml, application/atom+xml, application/xml, text/xml, */*"
+            ]
+            self.session = URLSession(configuration: configuration)
+        }
+    }
     
     func fetchFeed(url: String) async throws -> FeedResult {
         guard let feedURL = URL(string: url) else {
             throw FeedError.invalidURL
         }
-        
-        let (data, _) = try await URLSession.shared.data(from: feedURL)
+
+        var request = URLRequest(url: feedURL)
+        request.setValue("PodVault/1.0 (macOS) AppleWebKit/605.1.15", forHTTPHeaderField: "User-Agent")
+        request.setValue("application/rss+xml, application/atom+xml, application/xml, text/xml, */*", forHTTPHeaderField: "Accept")
+
+        let (data, response): (Data, URLResponse)
+        do {
+            (data, response) = try await session.data(for: request)
+        } catch {
+            throw FeedError.networkError(error)
+        }
+
+        if let httpResponse = response as? HTTPURLResponse,
+           !(200...299).contains(httpResponse.statusCode) {
+            throw FeedError.httpError(statusCode: httpResponse.statusCode)
+        }
         
         // Check if we got HTML instead of XML (user pasted a webpage URL)
         if let htmlString = String(data: data, encoding: .utf8),
@@ -28,8 +58,7 @@ class FeedService {
         }
         
         // Parse as XML feed
-        let parser = FeedParser(data: data, feedURL: url)
-        return try parser.parse()
+        return try parseFeedData(data, originalURL: url)
     }
     
     /// Subscribe to a new podcast by URL
@@ -165,11 +194,52 @@ class FeedService {
         }
         return nil
     }
+
+    private func parseFeedData(_ data: Data, originalURL: String) throws -> FeedResult {
+        do {
+            let parser = XMLFeedParser(data: data, feedURL: originalURL)
+            return try parser.parse()
+        } catch {
+            guard let xmlString = String(data: data, encoding: .utf8) else {
+                throw error
+            }
+
+            let sanitizedXML = sanitizeXML(xmlString)
+            guard sanitizedXML != xmlString, let sanitizedData = sanitizedXML.data(using: .utf8) else {
+                throw error
+            }
+
+            let parser = XMLFeedParser(data: sanitizedData, feedURL: originalURL)
+            return try parser.parse()
+        }
+    }
+
+    private func sanitizeXML(_ xml: String) -> String {
+        let withoutInvalidControls = xml.unicodeScalars.filter { scalar in
+            switch scalar.value {
+            case 0x9, 0xA, 0xD:
+                return true
+            case 0x20...0xD7FF, 0xE000...0xFFFD, 0x10000...0x10FFFF:
+                return true
+            default:
+                return false
+            }
+        }
+
+        let cleaned = String(String.UnicodeScalarView(withoutInvalidControls))
+        guard let regex = try? NSRegularExpression(pattern: "&(?!amp;|lt;|gt;|quot;|apos;|#\\d+;|#x[0-9A-Fa-f]+;)", options: []) else {
+            return cleaned
+        }
+
+        let range = NSRange(cleaned.startIndex..., in: cleaned)
+        return regex.stringByReplacingMatches(in: cleaned, options: [], range: range, withTemplate: "&amp;")
+    }
 }
 
 enum FeedError: LocalizedError {
     case invalidURL
     case networkError(Error)
+    case httpError(statusCode: Int)
     case parseError(String)
     case notAFeed(message: String)
     
@@ -179,6 +249,8 @@ enum FeedError: LocalizedError {
             return "Invalid URL"
         case .networkError(let error):
             return "Network error: \(error.localizedDescription)"
+        case .httpError(let statusCode):
+            return "Server returned HTTP \(statusCode)"
         case .parseError(let message):
             return "Failed to parse feed: \(message)"
         case .notAFeed(let message):
@@ -187,7 +259,7 @@ enum FeedError: LocalizedError {
     }
 }
 
-class FeedParser: NSObject, XMLParserDelegate {
+class XMLFeedParser: NSObject, XMLParserDelegate {
     private let data: Data
     private let feedURL: String
     private var episodes: [Episode] = []

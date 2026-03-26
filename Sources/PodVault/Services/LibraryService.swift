@@ -5,6 +5,11 @@ struct PodcastRefreshResult {
     let newEpisodeCount: Int
 }
 
+struct InactiveCleanupResult {
+    let removedPodcasts: [Podcast]
+    let preservedDownloadCount: Int
+}
+
 actor LibraryService {
     private let feedService: FeedService
     private let repository: PodcastRepository
@@ -40,6 +45,20 @@ actor LibraryService {
 
     func deletePodcast(id: String) async throws {
         try await repository.deletePodcast(id: id)
+    }
+
+    func cleanupInactivePodcasts(olderThan cutoffDate: Date) async throws -> InactiveCleanupResult {
+        let inactivePodcasts = try await repository.getInactivePodcasts(olderThan: cutoffDate)
+        var preservedDownloadCount = 0
+
+        for podcast in inactivePodcasts {
+            preservedDownloadCount += try await repository.archivePodcastDownloadsAndRemoveSubscription(id: podcast.id)
+        }
+
+        return InactiveCleanupResult(
+            removedPodcasts: inactivePodcasts,
+            preservedDownloadCount: preservedDownloadCount
+        )
     }
 
     func loadFavorites(legacyFavoritesURL: URL) async throws -> (podcastIDs: Set<String>, episodes: [Episode]) {

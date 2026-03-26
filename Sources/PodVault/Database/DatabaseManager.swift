@@ -44,6 +44,7 @@ final class DatabaseManager {
         let dbPath = podvaultDir.appendingPathComponent("podvault.sqlite")
         
         dbPool = try Self.makeDatabasePool(path: dbPath.path)
+        try Self.migrate(dbPool!)
         
         print("✅ Database initialized at: \(dbPath.path)")
     }
@@ -259,6 +260,40 @@ final class DatabaseManager {
                     DELETE FROM notes_fts WHERE rowid = old.rowid;
                 END
                 """)
+        }
+
+        migrator.registerMigration("v5_repair_legacy_favorites_schema") { db in
+            let podcastColumns = try db.columns(in: "podcasts").map(\.name)
+            if !podcastColumns.contains("isFavorite") {
+                try db.alter(table: "podcasts") { t in
+                    t.add(column: "isFavorite", .boolean).notNull().defaults(to: false)
+                }
+            }
+
+            let episodeColumns = try db.columns(in: "episodes").map(\.name)
+            if !episodeColumns.contains("isFavorite") {
+                try db.alter(table: "episodes") { t in
+                    t.add(column: "isFavorite", .boolean).notNull().defaults(to: false)
+                }
+            }
+
+            if try !db.indexes(on: "podcasts").contains(where: { $0.name == "idx_podcasts_favorite" }) {
+                try db.create(
+                    index: "idx_podcasts_favorite",
+                    on: "podcasts",
+                    columns: ["isFavorite"],
+                    condition: Column("isFavorite") == true
+                )
+            }
+
+            if try !db.indexes(on: "episodes").contains(where: { $0.name == "idx_episodes_favorite" }) {
+                try db.create(
+                    index: "idx_episodes_favorite",
+                    on: "episodes",
+                    columns: ["isFavorite"],
+                    condition: Column("isFavorite") == true
+                )
+            }
         }
         
         try migrator.migrate(database)

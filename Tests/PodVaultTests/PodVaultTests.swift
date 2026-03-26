@@ -235,6 +235,109 @@ final class PodVaultTests: XCTestCase {
         XCTAssertEqual(results.map(\.id), ["ep-fts-1"])
     }
 
+    func testFeedInputParserDeduplicatesAndSplitsBatchInput() {
+        let urls = FeedInputParser.urls(from: """
+        https://example.com/one.xml
+        https://example.com/two.xml, https://example.com/one.xml;
+        https://example.com/three.xml
+        """)
+
+        XCTAssertEqual(
+            urls,
+            [
+                "https://example.com/one.xml",
+                "https://example.com/two.xml",
+                "https://example.com/three.xml"
+            ]
+        )
+    }
+
+    func testRepositoryCleanupArchivesDownloadedEpisodesAndHidesPodcast() async throws {
+        let db = try DatabaseManager.makeTestDatabase(path: testDatabasePath)
+        let repo = PodcastRepository(db: db)
+
+        let stalePodcast = Podcast(
+            id: "stale-podcast",
+            feedURL: "https://example.com/stale.xml",
+            title: "Stale Feed",
+            lastSyncAt: Date(timeIntervalSince1970: 0)
+        )
+        let downloadedEpisode = Episode(
+            id: "downloaded-ep",
+            podcastId: stalePodcast.id,
+            guid: "downloaded-guid",
+            title: "Downloaded Episode",
+            pubDate: Date(timeIntervalSince1970: 1000),
+            downloadStatus: .downloaded,
+            downloadPath: "/tmp/downloaded.mp3"
+        )
+        let streamingEpisode = Episode(
+            id: "streaming-ep",
+            podcastId: stalePodcast.id,
+            guid: "streaming-guid",
+            title: "Stream Only",
+            pubDate: Date(timeIntervalSince1970: 1000)
+        )
+
+        try await repo.savePodcast(stalePodcast)
+        try await repo.saveEpisodes([downloadedEpisode, streamingEpisode])
+
+        let inactive = try await repo.getInactivePodcasts(olderThan: Date())
+        XCTAssertEqual(inactive.map(\.id), [stalePodcast.id])
+
+        let preservedCount = try await repo.archivePodcastDownloadsAndRemoveSubscription(id: stalePodcast.id)
+        XCTAssertEqual(preservedCount, 1)
+
+        let visiblePodcasts = try await repo.getAllPodcasts()
+        XCTAssertTrue(visiblePodcasts.isEmpty)
+
+        let archivedPodcast = try await repo.getPodcast(id: stalePodcast.id)
+        XCTAssertEqual(archivedPodcast?.feedURL, "podvault://archived/\(stalePodcast.id)")
+        XCTAssertEqual(archivedPodcast?.autoDownload, false)
+
+        let archivedEpisodes = try await repo.getEpisodes(forPodcast: stalePodcast.id)
+        XCTAssertEqual(archivedEpisodes.map(\.id), ["downloaded-ep"])
+        XCTAssertEqual(archivedEpisodes.first?.downloadPath, "/tmp/downloaded.mp3")
+    }
+
+    func testRefreshSummaryIncludesFailuresInSubtitle() {
+        let summary = RefreshSummary.libraryRefresh(
+            refreshedFeedCount: 2,
+            newEpisodeCount: 5,
+            failedFeeds: ["Broken Feed"]
+        )
+
+        XCTAssertEqual(summary.title, "Refresh finished with issues")
+        XCTAssertEqual(summary.subtitle, "2 feeds, 5 new episodes, 1 failed")
+        XCTAssertEqual(summary.failedFeeds, ["Broken Feed"])
+    }
+
+    func testOPMLServiceParsesNestedFeedsFromOPMLData() async throws {
+        let data = Data(
+            """
+            <?xml version="1.0" encoding="UTF-8"?>
+            <opml version="2.0">
+              <head>
+                <title>Subscriptions</title>
+              </head>
+              <body>
+                <outline text="Tech">
+                  <outline type="rss" text="Swift Talk" xmlUrl="https://example.com/swift.xml" htmlUrl="https://example.com/swift"/>
+                </outline>
+              </body>
+            </opml>
+            """.utf8
+        )
+
+        let document = try await OPMLService().parseOPML(from: data)
+
+        XCTAssertEqual(document.title, "Subscriptions")
+        XCTAssertEqual(document.feeds.count, 1)
+        XCTAssertEqual(document.feeds.first?.title, "Swift Talk")
+        XCTAssertEqual(document.feeds.first?.feedURL, "https://example.com/swift.xml")
+        XCTAssertEqual(document.feeds.first?.htmlURL, "https://example.com/swift")
+    }
+
     private func makeEpisode(
         id: String,
         podcastId: String,

@@ -3,6 +3,7 @@ import GRDB
 
 /// Repository for podcast and episode database operations
 actor PodcastRepository {
+    private static let archivedFeedPrefix = "podvault://archived/"
     private let db: DatabasePool
     
     init(db: DatabasePool = DatabaseManager.shared.database) {
@@ -13,7 +14,10 @@ actor PodcastRepository {
     
     func getAllPodcasts() async throws -> [Podcast] {
         try await db.read { db in
-            try Podcast.order(Podcast.Columns.title).fetchAll(db)
+            try Podcast
+                .order(Podcast.Columns.title)
+                .fetchAll(db)
+                .filter { !Self.isArchivedFeedURL($0.feedURL) }
         }
     }
     
@@ -23,6 +27,7 @@ actor PodcastRepository {
                 .filter(Podcast.Columns.isFavorite == true)
                 .order(Podcast.Columns.title)
                 .fetchAll(db)
+                .filter { !Self.isArchivedFeedURL($0.feedURL) }
         }
     }
     
@@ -55,6 +60,58 @@ actor PodcastRepository {
         _ = try await db.write { db in
             try Podcast.deleteOne(db, key: id)
         }
+    }
+
+    func getInactivePodcasts(olderThan cutoffDate: Date) async throws -> [Podcast] {
+        try await db.read { db in
+            let sql = """
+                SELECT podcasts.*
+                FROM podcasts
+                LEFT JOIN episodes ON episodes.podcastId = podcasts.id
+                WHERE podcasts.feedURL NOT LIKE ?
+                GROUP BY podcasts.id
+                HAVING COALESCE(MAX(episodes.pubDate), podcasts.lastSyncAt, podcasts.createdAt) < ?
+                ORDER BY COALESCE(MAX(episodes.pubDate), podcasts.lastSyncAt, podcasts.createdAt) ASC
+                """
+            return try Podcast.fetchAll(db, sql: sql, arguments: [Self.archivedFeedPrefix + "%", cutoffDate])
+        }
+    }
+
+    func archivePodcastDownloadsAndRemoveSubscription(id: String) async throws -> Int {
+        try await db.write { db in
+            guard var podcast = try Podcast.fetchOne(db, key: id) else { return 0 }
+
+            let downloadedRequest = Episode
+                .filter(Episode.Columns.podcastId == id)
+                .filter(Episode.Columns.downloadStatus == DownloadStatus.downloaded.rawValue)
+            let downloadedCount = try downloadedRequest.fetchCount(db)
+
+            if downloadedCount == 0 {
+                try Podcast.deleteOne(db, key: id)
+                return 0
+            }
+
+            podcast.feedURL = Self.archivedFeedPrefix + podcast.id
+            podcast.title = podcast.title.isEmpty ? "Archived Downloads" : "\(podcast.title) (Archived)"
+            podcast.description = "Preserved downloaded episodes from an inactive feed"
+            podcast.link = nil
+            podcast.lastSyncAt = nil
+            podcast.autoDownload = false
+            podcast.isFavorite = false
+            podcast.updatedAt = Date()
+            try podcast.save(db)
+
+            _ = try Episode
+                .filter(Episode.Columns.podcastId == id)
+                .filter(Episode.Columns.downloadStatus != DownloadStatus.downloaded.rawValue)
+                .deleteAll(db)
+
+            return downloadedCount
+        }
+    }
+
+    private static func isArchivedFeedURL(_ feedURL: String) -> Bool {
+        feedURL.hasPrefix(archivedFeedPrefix)
     }
     
     // MARK: - Episodes

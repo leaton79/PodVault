@@ -144,6 +144,7 @@ struct LibrarySidebarView: View {
     let onSetCategoryForPodcast: (Podcast) -> Void
     let onDeletePodcast: (Podcast) -> Void
     let onShowAddPodcast: () -> Void
+    let onCleanupInactivePodcasts: () -> Void
     let onDismissSyncSummary: () -> Void
     
     var body: some View {
@@ -361,16 +362,29 @@ struct LibrarySidebarView: View {
             
             Rectangle().fill(dividerColor).frame(height: 1)
             
-            Button(action: onShowAddPodcast) {
-                Label("Add Podcast", systemImage: "plus")
-                    .font(.system(size: 14 * scale, weight: .medium))
-                    .foregroundColor(buttonText)
-                    .frame(maxWidth: .infinity)
-                    .padding(.vertical, 10)
-                    .background(buttonBg)
-                    .cornerRadius(8)
+            VStack(spacing: 8) {
+                Button(action: onShowAddPodcast) {
+                    Label("Add Podcast", systemImage: "plus")
+                        .font(.system(size: 14 * scale, weight: .medium))
+                        .foregroundColor(buttonText)
+                        .frame(maxWidth: .infinity)
+                        .padding(.vertical, 10)
+                        .background(buttonBg)
+                        .cornerRadius(8)
+                }
+                .buttonStyle(.plain)
+
+                Button(action: onCleanupInactivePodcasts) {
+                    Label("Clean Inactive", systemImage: "trash")
+                        .font(.system(size: 13 * scale, weight: .medium))
+                        .foregroundColor(textColor)
+                        .frame(maxWidth: .infinity)
+                        .padding(.vertical, 9)
+                        .background(dividerColor.opacity(0.5))
+                        .cornerRadius(8)
+                }
+                .buttonStyle(.plain)
             }
-            .buttonStyle(.plain)
             .padding(12)
         }
         .background(sidebarBg)
