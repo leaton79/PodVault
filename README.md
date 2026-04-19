@@ -1,5 +1,7 @@
 # PodVault 🎧⚡
 
+**Notice:** This project was created with the assistance of GenAI tools. It should be carefully reviewed and independently inspected before being used in any production, security-sensitive, or otherwise critical context.
+
 A modern, native macOS podcast player built with Swift and SwiftUI.
 
 ![PodVault Screenshot](screenshot.png)
